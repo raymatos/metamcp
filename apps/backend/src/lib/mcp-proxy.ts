@@ -105,12 +105,19 @@ export default function mcpProxy({
 
       // Send error response back to client if it was a request (has id) and connection is still open
       if (isJSONRPCRequest(message) && !transportToClientClosed) {
+        // Surface the upstream HTTP status (e.g. 401 from an OAuth-protected
+        // server whose error body is empty) so clients can detect auth errors
+        // from the message text.
+        const httpStatus = (error as { code?: unknown })?.code;
         const errorResponse = {
           jsonrpc: "2.0" as const,
           id: message.id,
           error: {
             code: -32001,
-            message: error.message,
+            message:
+              typeof httpStatus === "number"
+                ? `HTTP ${httpStatus}: ${error.message}`
+                : error.message,
             data: error,
           },
         };

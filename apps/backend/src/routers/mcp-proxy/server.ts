@@ -5,7 +5,10 @@ import {
   SseError,
 } from "@modelcontextprotocol/sdk/client/sse.js";
 import { getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import {
+  StreamableHTTPClientTransport,
+  StreamableHTTPError,
+} from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
@@ -393,7 +396,10 @@ serverRouter.post("/mcp", async (req, res) => {
       try {
         serverTransport = await createTransport(req);
       } catch (error) {
-        if (error instanceof SseError && error.code === 401) {
+        if (
+        (error instanceof SseError || error instanceof StreamableHTTPError) &&
+        error.code === 401
+      ) {
           logger.error(
             "Received 401 Unauthorized from MCP server:",
             error.message,
@@ -554,7 +560,10 @@ serverRouter.get("/stdio", async (req, res) => {
       serverTransport = await createTransport(req);
       logger.info("Created server transport");
     } catch (error) {
-      if (error instanceof SseError && error.code === 401) {
+      if (
+        (error instanceof SseError || error instanceof StreamableHTTPError) &&
+        error.code === 401
+      ) {
         logger.error(
           "Received 401 Unauthorized from MCP server. Authentication failure.",
         );
@@ -750,7 +759,10 @@ serverRouter.get("/sse", async (req, res) => {
     try {
       serverTransport = await createTransport(req);
     } catch (error) {
-      if (error instanceof SseError && error.code === 401) {
+      if (
+        (error instanceof SseError || error instanceof StreamableHTTPError) &&
+        error.code === 401
+      ) {
         logger.error(
           "Received 401 Unauthorized from MCP server. Authentication failure.",
         );

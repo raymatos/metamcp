@@ -92,11 +92,12 @@ COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=nextjs:nodejs /app/package.json ./
 COPY --from=builder --chown=nextjs:nodejs /app/pnpm-workspace.yaml ./
 
-# Install production dependencies only
-RUN pnpm install --prod
-
-# Install drizzle-kit locally in backend for migrations
+# Add drizzle-kit (needed by the entrypoint for migrations) while the modules
+# dir copied from builder still has the dev include-set — pnpm 10 refuses an
+# add whose include-set differs from the installed one. Then prune to prod;
+# drizzle-kit survives as a declared dependency.
 RUN cd apps/backend && pnpm add drizzle-kit@0.31.1
+RUN pnpm install --prod
 
 # Copy startup script
 COPY --chown=nextjs:nodejs docker-entrypoint.sh ./

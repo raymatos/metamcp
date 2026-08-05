@@ -92,11 +92,12 @@ COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=nextjs:nodejs /app/package.json ./
 COPY --from=builder --chown=nextjs:nodejs /app/pnpm-workspace.yaml ./
 
-# Add drizzle-kit (needed by the entrypoint for migrations) while the modules
-# dir copied from builder still has the dev include-set — pnpm 10 refuses an
-# add whose include-set differs from the installed one. Then prune to prod;
-# drizzle-kit survives as a declared dependency.
-RUN cd apps/backend && pnpm add drizzle-kit@0.31.1
+# The entrypoint needs drizzle-kit at runtime, but upstream declares it only in
+# devDependencies, which the --prod prune below removes. Move it to dependencies
+# while the modules dir copied from builder still has the dev include-set
+# (pnpm 10 refuses an add whose include-set differs from the installed one),
+# then prune to prod.
+RUN cd apps/backend && pnpm remove drizzle-kit && pnpm add -P drizzle-kit@0.31.1
 RUN pnpm install --prod
 
 # Copy startup script

@@ -1,6 +1,9 @@
 # Use the official uv image as base
 FROM ghcr.io/astral-sh/uv:debian AS base
 
+# pnpm 10 aborts destructive ops (node_modules prune) without a TTY unless CI is set
+ENV CI=true
+
 # Install Node.js and pnpm directly
 RUN apt-get update && apt-get install -y \
     curl \

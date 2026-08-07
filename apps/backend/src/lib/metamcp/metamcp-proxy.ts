@@ -34,6 +34,8 @@ import {
   isExposedAdminToolName,
 } from "../admin-mcp/tools-registry";
 import { configService } from "../config.service";
+import { tryRefreshUpstreamTokens } from "../oauth-upstream/refresh-on-401";
+import { isUpstreamUnauthorizedError } from "../oauth-upstream/token-exchange";
 import { ConnectedClient } from "./client";
 import { getMcpServers } from "./fetch-metamcp";
 import { extractForwardedHeaders, mergeHeaders } from "./header-forwarding";
@@ -56,7 +58,7 @@ import {
   createToolOverridesListToolsMiddleware,
   mapOverrideNameToOriginal,
 } from "./metamcp-middleware/tool-overrides.functional";
-import { isBackendSessionLostError } from "./session-error";
+import { isRecoverableBackendError } from "./session-error";
 import { parseToolName } from "./tool-name-parser";
 import { toolsSyncCache } from "./tools-sync-cache";
 import { sanitizeName } from "./utils";
@@ -584,7 +586,29 @@ export const createServer = async (
     try {
       return (await callOnce(clientForTool)) as CallToolResult;
     } catch (error) {
-      if (!isBackendSessionLostError(error)) {
+      // Recovery classification mirrors requestWithSessionRecovery (the
+      // aggregate list handlers' wrapper — this bespoke path predates it):
+      // session-lost/transport-lost envelopes are recoverable, and so is an
+      // upstream auth-expired error when a refresh_token is on file. The
+      // auth case matters here specifically: providers that validate the
+      // JWT only on real API calls (Resend) fail tools/call with a 401
+      // while the pooled session — and even a reconnect's initialize —
+      // stays healthy, so only this path ever sees the expiry.
+      const recoverable = isRecoverableBackendError(error);
+      let params = undefined as
+        | Awaited<ReturnType<typeof getMcpServers>>[string]
+        | undefined;
+      let authExpired = false;
+      if (!recoverable && isUpstreamUnauthorizedError(error)) {
+        const serverParamsMap = await getMcpServers(
+          namespaceUuid,
+          includeInactiveServers,
+        );
+        params = serverParamsMap[serverUuid];
+        authExpired = Boolean(params?.oauth_tokens?.refresh_token);
+      }
+
+      if (!recoverable && !authExpired) {
         logger.error(
           `Error calling tool "${name}" through ${
             clientForTool.client.getServerVersion()?.name || "unknown"
@@ -595,17 +619,54 @@ export const createServer = async (
       }
 
       logger.warn(
-        `Backend reported session lost for server ${serverUuid} on tool "${name}"; invalidating pool and retrying once.`,
+        `Backend ${authExpired ? "auth expired" : "connection lost"} for server ${serverUuid} on tool "${name}"; invalidating pool and retrying once.`,
       );
+
+      // Rotate the token BEFORE the reconnect — see the matching branch in
+      // list-handler-recovery.ts for the full rationale.
+      if (authExpired && params) {
+        try {
+          const refresh = await tryRefreshUpstreamTokens(params);
+          if (refresh.status === "refreshed" && refresh.tokens) {
+            params.oauth_tokens = {
+              access_token: refresh.tokens.access_token,
+              token_type: refresh.tokens.token_type,
+              expires_in: refresh.tokens.expires_in,
+              scope:
+                typeof refresh.tokens.scope === "string"
+                  ? refresh.tokens.scope
+                  : undefined,
+              refresh_token:
+                typeof refresh.tokens.refresh_token === "string"
+                  ? refresh.tokens.refresh_token
+                  : undefined,
+            };
+            logger.info(
+              `[oauth] pre-reconnect refresh succeeded for server ${serverUuid} on tool "${name}"`,
+            );
+          } else {
+            logger.warn(
+              `[oauth] pre-reconnect refresh did not rotate tokens for server ${serverUuid}: ${refresh.status}`,
+            );
+          }
+        } catch (refreshError) {
+          logger.error(
+            `[oauth] pre-reconnect refresh threw for server ${serverUuid}:`,
+            refreshError,
+          );
+        }
+      }
 
       await mcpServerPool.invalidateServerConnection(sessionId, serverUuid);
       delete toolToClient[name];
 
-      const serverParamsMap = await getMcpServers(
-        namespaceUuid,
-        includeInactiveServers,
-      );
-      const params = serverParamsMap[serverUuid];
+      if (!params) {
+        const serverParamsMap = await getMcpServers(
+          namespaceUuid,
+          includeInactiveServers,
+        );
+        params = serverParamsMap[serverUuid];
+      }
       if (!params) {
         throw new Error(
           `Cannot re-initialize session: server ${serverUuid} no longer present in namespace ${namespaceUuid}`,

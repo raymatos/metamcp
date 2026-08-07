@@ -2,6 +2,7 @@ import { ServerParameters } from "@repo/zod-types";
 
 import logger from "@/utils/logger";
 
+import { tryRefreshUpstreamTokens } from "../oauth-upstream/refresh-on-401";
 import { isUpstreamUnauthorizedError } from "../oauth-upstream/token-exchange";
 import { ConnectedClient } from "./client";
 import { isRecoverableBackendError } from "./session-error";
@@ -94,6 +95,48 @@ export async function requestWithSessionRecovery<T>(
         error instanceof Error ? error.message : String(error)
       })`,
     );
+
+    // Auth-expired sessions need the token refreshed BEFORE the reconnect,
+    // not just a fresh transport. Providers that validate the JWT only on
+    // real API calls (Resend) accept `initialize` with an expired
+    // access_token, so the reconnect below succeeds without ever tripping
+    // connectMetaMcpClient's refresh-on-401 — and the retried request fails
+    // with the same expired token, forever. Refresh here, then hand the
+    // rotated token to getSession via the mutated params. On refresh
+    // failure fall through: the reconnect still gives providers that DO
+    // 401 the initialize (the common case) their connect-time refresh path.
+    if (authExpired) {
+      try {
+        const refresh = await tryRefreshUpstreamTokens(opts.params);
+        if (refresh.status === "refreshed" && refresh.tokens) {
+          opts.params.oauth_tokens = {
+            access_token: refresh.tokens.access_token,
+            token_type: refresh.tokens.token_type,
+            expires_in: refresh.tokens.expires_in,
+            scope:
+              typeof refresh.tokens.scope === "string"
+                ? refresh.tokens.scope
+                : undefined,
+            refresh_token:
+              typeof refresh.tokens.refresh_token === "string"
+                ? refresh.tokens.refresh_token
+                : undefined,
+          };
+          logger.info(
+            `[oauth] pre-reconnect refresh succeeded for ${opts.serverName} (${opts.serverUuid}) on ${opts.operation}`,
+          );
+        } else {
+          logger.warn(
+            `[oauth] pre-reconnect refresh did not rotate tokens for ${opts.serverName} (${opts.serverUuid}): ${refresh.status}`,
+          );
+        }
+      } catch (refreshError) {
+        logger.error(
+          `[oauth] pre-reconnect refresh threw for ${opts.serverName} (${opts.serverUuid}):`,
+          refreshError,
+        );
+      }
+    }
 
     await opts.pool.invalidateServerConnection(opts.sessionId, opts.serverUuid);
 

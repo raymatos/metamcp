@@ -1,11 +1,31 @@
 import { ServerParameters } from "@repo/zod-types";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { tryRefreshUpstreamTokens } from "../oauth-upstream/refresh-on-401";
 import { ConnectedClient } from "./client";
 import {
   RecoverySessionPool,
   requestWithSessionRecovery,
 } from "./list-handler-recovery";
+
+// The auth-expired branch refreshes tokens before reconnecting; stub the
+// refresh primitive so tests never touch the DB-backed oauth_sessions repo.
+vi.mock("../oauth-upstream/refresh-on-401", () => ({
+  tryRefreshUpstreamTokens: vi.fn(),
+}));
+const mockRefresh = vi.mocked(tryRefreshUpstreamTokens);
+
+beforeEach(() => {
+  mockRefresh.mockReset();
+  mockRefresh.mockResolvedValue({
+    status: "refreshed",
+    tokens: {
+      access_token: "rotated-token",
+      token_type: "Bearer",
+      refresh_token: "rotated-refresh",
+    },
+  });
+});
 
 // The exact envelope shape the backend produces when its session died
 // (matches session-error.test.ts fixtures). isRecoverableBackendError
@@ -178,6 +198,46 @@ describe("requestWithSessionRecovery", () => {
       "ns-1",
     );
     expect(attempt).toHaveBeenNthCalledWith(2, fresh);
+    // Tokens are refreshed BEFORE the reconnect and handed to getSession
+    // via the mutated params — providers that accept `initialize` with an
+    // expired token (Resend) never trip the connect-time refresh, so this
+    // is the only path that rotates their token.
+    expect(mockRefresh).toHaveBeenCalledWith(paramsWithRefresh);
+    expect(paramsWithRefresh.oauth_tokens?.access_token).toBe("rotated-token");
+    expect(paramsWithRefresh.oauth_tokens?.refresh_token).toBe(
+      "rotated-refresh",
+    );
+  });
+
+  it("still reconnects when the pre-reconnect refresh fails", async () => {
+    mockRefresh.mockResolvedValue({ status: "failed", error: "invalid_grant" });
+    const stale = makeSession("stale");
+    const fresh = makeSession("fresh");
+    const pool = makePool(fresh);
+    const paramsWithRefresh = {
+      ...params,
+      oauth_tokens: {
+        access_token: "expired-token",
+        token_type: "Bearer",
+        refresh_token: "refresh-abc",
+      },
+    } as ServerParameters;
+    const attempt = vi
+      .fn()
+      .mockRejectedValueOnce(upstreamAuthExpiredError())
+      .mockResolvedValueOnce("recovered-anyway");
+
+    await expect(
+      requestWithSessionRecovery({
+        ...baseOpts(pool, stale),
+        params: paramsWithRefresh,
+        attempt,
+      }),
+    ).resolves.toBe("recovered-anyway");
+    // Token untouched on failed refresh; reconnect still attempted so the
+    // connect-time refresh path gets its shot.
+    expect(paramsWithRefresh.oauth_tokens?.access_token).toBe("expired-token");
+    expect(pool.getSession).toHaveBeenCalledTimes(1);
   });
 
   it("rethrows an upstream 401 without invalidating when no refresh_token is on file", async () => {

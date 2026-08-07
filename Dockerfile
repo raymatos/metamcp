@@ -72,6 +72,13 @@ LABEL org.opencontainers.image.vendor="metatool-ai"
 # Install curl for health checks
 RUN apt-get update && apt-get install -y curl postgresql-client && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# STDIO MCP server binaries that hosted server definitions invoke by name.
+# mcp-grafana (Go, no npm/PyPI distribution) — pinned for reproducible builds.
+ARG MCP_GRAFANA_VERSION=1.0.0
+RUN curl -fsSL "https://github.com/grafana/mcp-grafana/releases/download/v${MCP_GRAFANA_VERSION}/mcp-grafana_Linux_x86_64.tar.gz" \
+    | tar -xz -C /usr/local/bin mcp-grafana \
+    && chmod +x /usr/local/bin/mcp-grafana
+
 # Create non-root user with proper home directory
 RUN addgroup --system --gid 1001 nodejs
 RUN adduser --system --uid 1001 --home /home/nextjs nextjs && \

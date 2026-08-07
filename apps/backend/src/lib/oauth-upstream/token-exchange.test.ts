@@ -409,6 +409,42 @@ describe("isUpstreamUnauthorizedError", () => {
     ).toBe(true);
   });
 
+  // The SDK's StreamableHTTPError/SseError put the HTTP status on `.code`
+  // and only the upstream's response BODY in the message. Production
+  // observation 2026-08-07 (contractor-tshirts): a 401 whose body said
+  // "Invalid, revoked, or expired token" — no "401", no "unauthorized" —
+  // was missed by the message regexes, so the refresh cascade never ran.
+  it("recognises a 401 carried on .code when the message lacks auth keywords", () => {
+    class StreamableHTTPError extends Error {
+      constructor(
+        readonly code: number | undefined,
+        message: string,
+      ) {
+        super(`Streamable HTTP error: ${message}`);
+      }
+    }
+    expect(
+      isUpstreamUnauthorizedError(
+        new StreamableHTTPError(
+          401,
+          'Error POSTing to endpoint: {"success":false,"message":"Invalid, revoked, or expired token"}',
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not treat JSON-RPC error codes or other statuses on .code as 401", () => {
+    const withCode = (code: number, message: string) =>
+      Object.assign(new Error(message), { code });
+    expect(isUpstreamUnauthorizedError(withCode(-32001, "timed out"))).toBe(
+      false,
+    );
+    expect(isUpstreamUnauthorizedError(withCode(500, "server exploded"))).toBe(
+      false,
+    );
+    expect(isUpstreamUnauthorizedError(withCode(403, "forbidden"))).toBe(false);
+  });
+
   it("returns false for unrelated errors", () => {
     expect(isUpstreamUnauthorizedError(null)).toBe(false);
     expect(isUpstreamUnauthorizedError(undefined)).toBe(false);

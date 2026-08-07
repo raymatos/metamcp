@@ -347,13 +347,29 @@ export function isUpstreamUnauthorizedError(error: unknown): boolean {
   ) {
     return true;
   }
+
+  // The SDK's StreamableHTTPError / SseError carry the HTTP status on
+  // `.code` while the message only embeds the upstream's response BODY —
+  // which is provider-authored and need not contain "401" or
+  // "unauthorized" at all. Production observation 2026-08-07
+  // (contractor-tshirts): a 401 with body `{"success":false,"message":
+  // "Invalid, revoked, or expired token"}` sailed past the message
+  // regexes below, so the refresh cascade never ran and the server
+  // stayed down through all connect retries. Exact-match 401 only:
+  // JSON-RPC error codes on McpError are negative, so there is no
+  // collision, and 403 stays with the narrow envelope heuristics below.
+  const code = (error as { code?: unknown }).code;
+  if (code === 401) return true;
+
   if (!(error instanceof Error)) return false;
 
   const message = error.message;
 
   if (/\b401\b|unauthorized/i.test(message)) return true;
 
-  if (/\b403\b/.test(message)) {
+  // Same `.code`-vs-message split for 403: the envelope heuristics below
+  // only need the status signal, which may live on `.code` alone.
+  if (/\b403\b/.test(message) || code === 403) {
     const codes = INVALID_TOKEN_OAUTH_ERROR_CODES.join("|");
     const oauthEnvelope = new RegExp(`"error"\\s*:\\s*"(?:${codes})"`);
     if (oauthEnvelope.test(message)) return true;

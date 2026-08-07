@@ -2,6 +2,7 @@ import { ServerParameters } from "@repo/zod-types";
 
 import logger from "@/utils/logger";
 
+import { isUpstreamUnauthorizedError } from "../oauth-upstream/token-exchange";
 import { ConnectedClient } from "./client";
 import { isRecoverableBackendError } from "./session-error";
 
@@ -69,12 +70,27 @@ export async function requestWithSessionRecovery<T>(
   try {
     return await opts.attempt(opts.session);
   } catch (error) {
-    if (!isRecoverableBackendError(error)) {
+    // A pooled session can outlive its upstream OAuth access token (most
+    // providers issue 1h tokens; the pool holds connections indefinitely).
+    // Requests on such a session fail with an upstream 401 that is neither
+    // session-lost nor transport-lost, so without this branch the dead
+    // session was never invalidated and the server stayed excluded from
+    // every aggregate response until a manual backend restart. Recovery is
+    // only worth attempting when a refresh_token is on file — the
+    // invalidate + reconnect below routes through connectMetaMcpClient's
+    // refresh-on-401 cascade, which needs it. Without one, reconnecting
+    // would just retry the same dead token through the connect backoff and
+    // stall the aggregate response for nothing.
+    const authExpired =
+      Boolean(opts.params.oauth_tokens?.refresh_token) &&
+      isUpstreamUnauthorizedError(error);
+
+    if (!isRecoverableBackendError(error) && !authExpired) {
       throw error;
     }
 
     logger.warn(
-      `Backend connection lost for server ${opts.serverUuid} (${opts.serverName}) on ${opts.operation}; invalidating pool and retrying once. (envelope: ${
+      `Backend ${authExpired ? "auth expired" : "connection lost"} for server ${opts.serverUuid} (${opts.serverName}) on ${opts.operation}; invalidating pool and retrying once. (envelope: ${
         error instanceof Error ? error.message : String(error)
       })`,
     );

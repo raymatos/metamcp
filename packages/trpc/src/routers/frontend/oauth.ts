@@ -3,6 +3,8 @@ import {
   ExchangeOAuthTokenResponseSchema,
   GetOAuthSessionRequestSchema,
   GetOAuthSessionResponseSchema,
+  PrepareOAuthAuthorizeRequestSchema,
+  PrepareOAuthAuthorizeResponseSchema,
   RefreshOAuthTokenRequestSchema,
   RefreshOAuthTokenResponseSchema,
   UpsertOAuthSessionRequestSchema,
@@ -23,6 +25,10 @@ export const createOAuthRouter = (
     upsert: (
       input: z.infer<typeof UpsertOAuthSessionRequestSchema>,
     ) => Promise<z.infer<typeof UpsertOAuthSessionResponseSchema>>;
+    prepareAuthorize: (
+      input: z.infer<typeof PrepareOAuthAuthorizeRequestSchema>,
+      userId: string,
+    ) => Promise<z.infer<typeof PrepareOAuthAuthorizeResponseSchema>>;
     exchangeToken: (
       input: z.infer<typeof ExchangeOAuthTokenRequestSchema>,
       userId: string,
@@ -48,6 +54,19 @@ export const createOAuthRouter = (
       .output(UpsertOAuthSessionResponseSchema)
       .mutation(async ({ input }) => {
         return await implementations.upsert(input);
+      }),
+
+    // Protected: Server-side authorize-flow preparation — discovery, dynamic
+    // client registration, and PKCE/state generation. Returns the upstream
+    // authorize URL the browser should redirect to. Exists because the
+    // SDK's browser-side `auth()` CORS-fails against providers without
+    // permissive `/.well-known/*` and `/register` endpoints (Resend, most
+    // enterprise IdPs). Same ownership/SSRF stance as exchangeToken.
+    prepareAuthorize: protectedProcedure
+      .input(PrepareOAuthAuthorizeRequestSchema)
+      .output(PrepareOAuthAuthorizeResponseSchema)
+      .mutation(async ({ input, ctx }) => {
+        return await implementations.prepareAuthorize(input, ctx.user.id);
       }),
 
     // Protected: Server-side authorization-code-to-tokens exchange. This

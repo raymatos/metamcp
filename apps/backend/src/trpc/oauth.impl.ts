@@ -4,6 +4,8 @@ import {
   ExchangeOAuthTokenResponseSchema,
   GetOAuthSessionRequestSchema,
   GetOAuthSessionResponseSchema,
+  PrepareOAuthAuthorizeRequestSchema,
+  PrepareOAuthAuthorizeResponseSchema,
   RefreshOAuthTokenRequestSchema,
   RefreshOAuthTokenResponseSchema,
   UpsertOAuthSessionRequestSchema,
@@ -18,6 +20,13 @@ import {
   oauthSessionsRepository,
 } from "../db/repositories";
 import { OAuthSessionsSerializer } from "../db/serializers";
+import {
+  discoverUpstreamAuthMetadata,
+  DynamicRegistrationError,
+  generatePkcePair,
+  generateState,
+  registerDynamicClient,
+} from "../lib/oauth-upstream/authorize-flow";
 import { tryRefreshUpstreamTokens } from "../lib/oauth-upstream/refresh-on-401";
 import {
   discoverAuthorizationServerMetadata,
@@ -188,6 +197,162 @@ export const oauthImplementations = {
         error: error instanceof Error ? error.message : "Internal server error",
       };
     }
+  },
+
+  // Server-side authorize-flow preparation. The browser used to run the
+  // MCP SDK's `auth()` here: discovery of `/.well-known/oauth-protected-resource`
+  // and `/.well-known/oauth-authorization-server`, dynamic client
+  // registration (`POST /register`), PKCE generation, then a redirect to
+  // the upstream's /authorize. Every one of those cross-origin fetches
+  // requires the provider to send CORS headers — Resend and most
+  // enterprise IdPs don't, so the flow died in the browser before the
+  // authorize page ever appeared. This procedure runs the whole
+  // pre-redirect half server-to-server and returns a fully-assembled
+  // authorize URL; the browser's only remaining job is to navigate to it.
+  //
+  // Discovered token/authorize endpoints are persisted into
+  // `client_information` so the exchangeToken/refreshToken procedures
+  // (whose `resolveTokenEndpoint` prefers `client_information.token_endpoint`)
+  // reach the right endpoint even when it lives on a different origin than
+  // the MCP server (RFC 9728 authorization_servers indirection).
+  prepareAuthorize: async (
+    input: z.infer<typeof PrepareOAuthAuthorizeRequestSchema>,
+    userId: string,
+  ): Promise<z.infer<typeof PrepareOAuthAuthorizeResponseSchema>> => {
+    const serverResolution = await resolveOwnedServerUrl(
+      input.mcp_server_uuid,
+      userId,
+    );
+    if (!serverResolution.ok) {
+      return { success: false as const, ...serverResolution.error };
+    }
+    const serverUrl = serverResolution.url;
+    const redirectUri = resolveRedirectUri();
+
+    const discovery = await discoverUpstreamAuthMetadata(serverUrl);
+
+    const session = await oauthSessionsRepository.findByMcpServerUuid(
+      input.mcp_server_uuid,
+    );
+    let clientInformation = clientInfoAsRecord(session?.client_information);
+    let clientId =
+      clientInformation && typeof clientInformation.client_id === "string"
+        ? (clientInformation.client_id as string)
+        : null;
+
+    if (!clientId) {
+      const registrationEndpoint = discovery.metadata?.registration_endpoint;
+      if (!registrationEndpoint) {
+        return {
+          success: false as const,
+          error: "registration_unsupported",
+          error_description:
+            "The upstream does not advertise a dynamic client registration endpoint. " +
+            "Fill in the pre-registered OAuth client form for this server, then retry.",
+        };
+      }
+      let registered: Record<string, unknown>;
+      try {
+        registered = await registerDynamicClient({
+          registrationEndpoint,
+          clientMetadata: {
+            redirect_uris: [redirectUri],
+            token_endpoint_auth_method: "none",
+            grant_types: ["authorization_code", "refresh_token"],
+            response_types: ["code"],
+            client_name: "MetaMCP",
+            client_uri: "https://github.com/metatool-ai/metamcp",
+          },
+        });
+      } catch (error) {
+        if (error instanceof DynamicRegistrationError) {
+          logger.warn(
+            `[oauth] dynamic registration failed — server=${input.mcp_server_uuid} ` +
+              `status=${error.status}: ${error.message}`,
+          );
+          return {
+            success: false as const,
+            error: "registration_failed",
+            error_description: error.message,
+            upstream_status: error.status,
+          };
+        }
+        throw error;
+      }
+      clientInformation = registered;
+      clientId = registered.client_id as string;
+      logger.info(
+        `[oauth] dynamic registration succeeded — server=${input.mcp_server_uuid} ` +
+          `client_id=${redactToken(clientId)}`,
+      );
+    }
+
+    // Backfill discovered endpoints onto client_information so the
+    // exchange/refresh procedures resolve them without re-running the
+    // discovery chain (their built-in discovery only checks the MCP server
+    // origin, which misses AS-indirected providers like Resend). Explicit
+    // values already on the row (pre-registered client form) win.
+    if (discovery.metadata?.token_endpoint && clientInformation) {
+      clientInformation = {
+        ...clientInformation,
+        token_endpoint:
+          clientInformation.token_endpoint ?? discovery.metadata.token_endpoint,
+        ...(discovery.metadata.authorization_endpoint && {
+          authorization_endpoint:
+            clientInformation.authorization_endpoint ??
+            discovery.metadata.authorization_endpoint,
+        }),
+      };
+    }
+
+    const { verifier, challenge } = generatePkcePair();
+    const state = generateState();
+
+    await oauthSessionsRepository.upsert({
+      mcp_server_uuid: input.mcp_server_uuid,
+      ...(clientInformation && {
+        client_information: clientInformation as OAuthClientInformation,
+      }),
+      code_verifier: verifier,
+      expected_state: state,
+    });
+
+    const authorizationEndpoint =
+      (typeof clientInformation?.authorization_endpoint === "string" &&
+      clientInformation.authorization_endpoint.length > 0
+        ? clientInformation.authorization_endpoint
+        : undefined) ??
+      discovery.metadata?.authorization_endpoint ??
+      new URL("/authorize", discovery.authorizationServerBase).toString();
+
+    const authUrl = new URL(authorizationEndpoint);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("client_id", clientId);
+    authUrl.searchParams.set("redirect_uri", redirectUri);
+    authUrl.searchParams.set("code_challenge", challenge);
+    authUrl.searchParams.set("code_challenge_method", "S256");
+    authUrl.searchParams.set("state", state);
+    // RFC 8707 resource indicator — the MCP authorization spec requires
+    // binding the requested token to the MCP server's canonical URI.
+    authUrl.searchParams.set("resource", serverUrl);
+    const scope =
+      typeof clientInformation?.scope === "string" &&
+      clientInformation.scope.length > 0
+        ? clientInformation.scope
+        : discovery.protectedResource?.scopes_supported?.join(" ");
+    if (scope) {
+      authUrl.searchParams.set("scope", scope);
+    }
+
+    logger.info(
+      `[oauth] authorize flow prepared — server=${input.mcp_server_uuid} ` +
+        `authorize_endpoint=${authorizationEndpoint} client_id=${redactToken(clientId)}`,
+    );
+
+    return {
+      success: true as const,
+      authorization_url: authUrl.toString(),
+    };
   },
 
   // Server-side authorization-code-to-token exchange.

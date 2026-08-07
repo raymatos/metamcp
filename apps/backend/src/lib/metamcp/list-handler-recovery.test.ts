@@ -17,6 +17,17 @@ const sessionLostError = () =>
 
 const transportLostError = () => new Error("Not connected");
 
+// The exact envelope the SDK's StreamableHTTPClientTransport surfaces when
+// a pooled session's upstream OAuth access token has expired mid-life
+// (production observation 2026-08-07, i9labs-kanban). Neither session-lost
+// nor transport-lost, but recoverable when a refresh_token is on file:
+// invalidate + reconnect routes through connectMetaMcpClient's
+// refresh-on-401 cascade.
+const upstreamAuthExpiredError = () =>
+  new Error(
+    'Streamable HTTP error: Error POSTing to endpoint: {"jsonrpc":"2.0","error":{"code":-32001,"message":"Unauthorized: authenticate via OAuth or provide a valid API key via the x-api-key header"},"id":null}',
+  );
+
 const makeSession = (label: string): ConnectedClient =>
   ({ label }) as unknown as ConnectedClient;
 
@@ -129,6 +140,56 @@ describe("requestWithSessionRecovery", () => {
     ).rejects.toThrow(
       /Failed to re-initialize session for server server-1 .* tools\/list/,
     );
+    expect(attempt).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovers from an upstream auth-expired 401 when a refresh_token is on file", async () => {
+    const stale = makeSession("stale");
+    const fresh = makeSession("fresh");
+    const pool = makePool(fresh);
+    const paramsWithRefresh = {
+      ...params,
+      oauth_tokens: {
+        access_token: "expired-token",
+        token_type: "Bearer",
+        refresh_token: "refresh-abc",
+      },
+    } as ServerParameters;
+    const attempt = vi
+      .fn()
+      .mockRejectedValueOnce(upstreamAuthExpiredError())
+      .mockResolvedValueOnce(["tool-c"]);
+
+    const result = await requestWithSessionRecovery({
+      ...baseOpts(pool, stale),
+      params: paramsWithRefresh,
+      attempt,
+    });
+
+    expect(result).toEqual(["tool-c"]);
+    expect(pool.invalidateServerConnection).toHaveBeenCalledWith(
+      "session-abc",
+      "server-1",
+    );
+    expect(pool.getSession).toHaveBeenCalledWith(
+      "session-abc",
+      "server-1",
+      paramsWithRefresh,
+      "ns-1",
+    );
+    expect(attempt).toHaveBeenNthCalledWith(2, fresh);
+  });
+
+  it("rethrows an upstream 401 without invalidating when no refresh_token is on file", async () => {
+    const session = makeSession("stale");
+    const pool = makePool(undefined);
+    const boom = upstreamAuthExpiredError();
+    const attempt = vi.fn().mockRejectedValue(boom);
+
+    await expect(
+      requestWithSessionRecovery({ ...baseOpts(pool, session), attempt }),
+    ).rejects.toBe(boom);
+    expect(pool.invalidateServerConnection).not.toHaveBeenCalled();
     expect(attempt).toHaveBeenCalledTimes(1);
   });
 

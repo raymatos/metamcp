@@ -1,4 +1,3 @@
-import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import {
   SSEClientTransport,
@@ -24,11 +23,9 @@ import {
   Progress,
   PromptListChangedNotificationSchema,
   PromptReference,
-  Request,
   ResourceListChangedNotificationSchema,
   ResourceReference,
   ResourceUpdatedNotificationSchema,
-  Result,
   ServerCapabilities,
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
@@ -48,7 +45,7 @@ import {
   StdErrNotificationSchema,
 } from "../lib/notificationTypes";
 import { createAuthProvider } from "../lib/oauth-provider";
-import { trpc } from "../lib/trpc";
+import { trpc, vanillaTrpcClient } from "../lib/trpc";
 
 // Mirror the MCP SDK's zod 3/4 compatibility types. SDK 1.26 result schemas use
 // the zod 4 API (surfaced via zod 3.25's zod/v4 export), so request helpers must
@@ -311,17 +308,59 @@ export function useConnection({
     );
   });
 
+  // On upstream 401: run the OAuth flow through the backend instead of the
+  // SDK's browser-side `auth()`. The browser path fetches the upstream's
+  // `/.well-known/*` documents and POSTs `/register` cross-origin, which
+  // CORS-fails against providers that don't whitelist our origin (Resend,
+  // most enterprise IdPs). The backend runs the same steps server-to-server
+  // (`oauth.prepareAuthorize`) and hands back a ready authorize URL; the
+  // browser's only job is to navigate to it. A server-side refresh-token
+  // grant is attempted first so an expired-but-refreshable session recovers
+  // without bouncing the user through the provider's consent page.
   const handleAuthError = useMemoizedFn(async (error: unknown) => {
-    if (is401Error(error)) {
-      sessionStorage.setItem(SESSION_KEYS.SERVER_URL, url || "");
-      sessionStorage.setItem(SESSION_KEYS.MCP_SERVER_UUID, mcpServerUuid);
-
-      const result = await auth(authProvider, {
-        serverUrl: url || "",
-      });
-      return result === "AUTHORIZED";
+    if (!is401Error(error)) {
+      return false;
     }
-    return false;
+    // MetaMCP-endpoint connections authenticate against MetaMCP itself —
+    // there is no upstream OAuth flow to run.
+    if (isMetaMCP || !mcpServerUuid) {
+      return false;
+    }
+
+    try {
+      const refreshResult =
+        await vanillaTrpcClient.frontend.oauth.refreshToken.mutate({
+          mcp_server_uuid: mcpServerUuid,
+        });
+      if (refreshResult.success) {
+        return true; // Tokens rotated server-side — retry the connection.
+      }
+    } catch (refreshError) {
+      console.warn("Server-side token refresh failed:", refreshError);
+    }
+
+    // The callback page recovers the flow's context from these keys.
+    sessionStorage.setItem(SESSION_KEYS.SERVER_URL, url || "");
+    sessionStorage.setItem(SESSION_KEYS.MCP_SERVER_UUID, mcpServerUuid);
+
+    const prepared =
+      await vanillaTrpcClient.frontend.oauth.prepareAuthorize.mutate({
+        mcp_server_uuid: mcpServerUuid,
+      });
+    if (!prepared.success) {
+      console.error(
+        "Failed to prepare OAuth authorization:",
+        prepared.error,
+        prepared.error_description,
+      );
+      toast.error(
+        `OAuth authorization failed: ${prepared.error_description ?? prepared.error}`,
+      );
+      return false;
+    }
+
+    window.location.href = prepared.authorization_url;
+    return false; // Navigation takes over; no in-page retry.
   });
 
   const connect = useMemoizedFn(
@@ -432,8 +471,12 @@ export function useConnection({
               mcpProxyServerUrl.searchParams.append("command", command);
               mcpProxyServerUrl.searchParams.append("args", args);
               mcpProxyServerUrl.searchParams.append("env", JSON.stringify(env));
+              // No authProvider here: passing one makes the SDK transport run
+              // its browser-side `auth()` (discovery + registration fetches)
+              // on 401, which CORS-fails against most providers. 401s must
+              // surface to handleAuthError, which routes the flow through the
+              // backend's prepareAuthorize instead.
               transportOptions = {
-                authProvider: authProvider,
                 eventSourceInit: {
                   fetch: (
                     url: string | URL | globalThis.Request,
@@ -491,8 +534,9 @@ export function useConnection({
             case McpServerTypeEnum.enum.STREAMABLE_HTTP:
               mcpProxyServerUrl = new URL(`/mcp-proxy/server/mcp`, getAppUrl());
               mcpProxyServerUrl.searchParams.append("url", url);
+              // No authProvider — see the STDIO branch comment: 401s must
+              // reach handleAuthError so the backend runs the OAuth flow.
               transportOptions = {
-                authProvider: authProvider,
                 eventSourceInit: {
                   fetch: (
                     url: string | URL | globalThis.Request,

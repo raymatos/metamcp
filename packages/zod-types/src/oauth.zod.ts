@@ -230,6 +230,31 @@ export const ExchangeOAuthTokenResponseSchema = z.union([
   }),
 ]);
 
+// Server-side authorize-flow preparation: discovery, dynamic client
+// registration, and PKCE/state generation all run on the backend, and the
+// frontend receives a fully-assembled upstream authorize URL to redirect
+// to. This replaces the browser-side SDK `auth()` path, which CORS-fails
+// against providers that don't set Access-Control-Allow-Origin on their
+// `/.well-known/*` and `/register` endpoints (Resend, most enterprise
+// IdPs). Same SSRF stance as the exchange/refresh procedures: the upstream
+// URL is resolved server-side from the mcp_servers row, never from input.
+export const PrepareOAuthAuthorizeRequestSchema = z.object({
+  mcp_server_uuid: z.string().uuid(),
+});
+
+export const PrepareOAuthAuthorizeResponseSchema = z.union([
+  z.object({
+    success: z.literal(true),
+    authorization_url: z.string().url(),
+  }),
+  z.object({
+    success: z.literal(false),
+    error: z.string(),
+    error_description: z.string().optional(),
+    upstream_status: z.number().optional(),
+  }),
+]);
+
 // Server-side refresh-token grant. Same CORS rationale: the upstream's
 // token endpoint typically rejects browser-origin requests. As with
 // `ExchangeOAuthTokenRequestSchema`, the upstream URL is NOT accepted

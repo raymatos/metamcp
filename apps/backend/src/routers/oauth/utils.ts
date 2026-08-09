@@ -74,21 +74,32 @@ export function validateRedirectUri(
       return false;
     }
 
-    // For production, only allow HTTPS
+    // RFC 8252 §7.3 / OAuth 2.1: native-app clients (Claude Code, Cursor,
+    // MCP Inspector, ...) redirect to a loopback address with an ephemeral
+    // port, over plain http — the traffic never leaves the machine, so the
+    // https requirement explicitly does not apply. Rejecting these breaks
+    // every CLI client's `/mcp` OAuth flow against this server.
+    const hostname = parsedUri.hostname.toLowerCase();
+    const isLoopback =
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "::1" ||
+      hostname === "[::1]";
+
+    // For production, only allow HTTPS (loopback excepted, per above).
     if (
       process.env.NODE_ENV === "production" &&
-      parsedUri.protocol !== "https:"
+      parsedUri.protocol !== "https:" &&
+      !isLoopback
     ) {
       return false;
     }
 
-    // Prevent localhost/private IPs in production
-    if (process.env.NODE_ENV === "production") {
-      const hostname = parsedUri.hostname.toLowerCase();
+    // Prevent private-range IPs in production. Loopback is intentionally
+    // NOT in this list — see the RFC 8252 note above; private ranges stay
+    // blocked because a redirect there would leave the machine.
+    if (process.env.NODE_ENV === "production" && !isLoopback) {
       if (
-        hostname === "localhost" ||
-        hostname === "127.0.0.1" ||
-        hostname === "::1" ||
         hostname.startsWith("192.168.") ||
         hostname.startsWith("10.") ||
         hostname.startsWith("172.")

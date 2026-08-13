@@ -83,15 +83,26 @@ export class McpServerPool {
    */
   static getInstance(
     defaultIdleCount: number = 1,
-    maxConnectionsPerServer: number = 5,
+    maxConnectionsPerServer?: number,
   ): McpServerPool {
     if (!McpServerPool.instance) {
       const envMax = parseInt(process.env.MAX_TOTAL_CONNECTIONS || "", 10);
       const maxConn = Number.isFinite(envMax) && envMax > 0 ? envMax : 100;
+      // Per-server cap is env-configurable too: with several concurrent
+      // client sessions (multiple machines / a connector + a retry loop),
+      // a hard 5 starves later sessions of a slot and surfaces as the
+      // backend "dropping" every few minutes. Default 10; explicit arg wins.
+      const envPerServer = parseInt(
+        process.env.MAX_CONNECTIONS_PER_SERVER || "",
+        10,
+      );
+      const perServer =
+        maxConnectionsPerServer ??
+        (Number.isFinite(envPerServer) && envPerServer > 0 ? envPerServer : 10);
       McpServerPool.instance = new McpServerPool(
         defaultIdleCount,
         maxConn,
-        maxConnectionsPerServer,
+        perServer,
       );
     }
     return McpServerPool.instance;
@@ -274,6 +285,18 @@ export class McpServerPool {
         `Skipping connection for server ${params.name} (${params.uuid}) - connection limit reached`,
       );
       return undefined;
+    }
+
+    // Also enforce the PER-SERVER cap here, not just the global one. The
+    // caller (getSession) checks it before this async call, but the
+    // reconnect-on-401 / post-crash paths reach here directly — without this
+    // guard an OAuth-refreshing server (hourly token) drifts past its cap
+    // (observed 7/5 for i9labs-kanban), leaking connections that never reap.
+    if (!this.canCreateConnectionForServer(params.uuid)) {
+      logger.warn(
+        `Per-server cap ${this.maxConnectionsPerServer} reached for ${params.name} (${params.uuid}) in createNewConnection; reusing oldest active instead of spawning`,
+      );
+      return this.findOldestActiveConnectionForServer(params.uuid) ?? undefined;
     }
 
     logger.info(

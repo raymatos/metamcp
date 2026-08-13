@@ -161,7 +161,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    restart: "no"
+    # Self-heal on OOM/crash. VM 175 is memory-tight (~7.7 GB) and the app
+    # has been OOM-killed (exit 137); with "no" it stayed dead until a manual
+    # start. unless-stopped restarts it automatically but still honors an
+    # explicit `docker stop`.
+    restart: unless-stopped
     volumes:
       # Persist the uv cache across container recreates. Without this, every
       # `docker compose up -d`/recreate wipes the writable layer and the next

@@ -60,3 +60,6 @@ docs
 **/*.test.ts
 **/*.spec.js
 **/*.spec.ts
+# Runtime secret mounts (uid 1001, not build inputs)
+mcp-secrets
+docker-compose.override.yml

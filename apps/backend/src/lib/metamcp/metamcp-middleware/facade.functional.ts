@@ -162,7 +162,8 @@ function metaTools(names: ReturnType<typeof resolveMetaToolNames>): Tool[] {
   return [
     {
       name: names.search,
-      description: "Search facade tools available in this namespace.",
+      description:
+        "IMPORTANT: this connector lists only a curated subset of its tools directly — hundreds more across all connected servers exist but are unlisted. Before concluding a capability is unavailable, search here by keyword (matches tool names and descriptions; optional server filter), then invoke results via the execute meta-tool.",
       inputSchema: {
         type: "object",
         properties: {
@@ -176,7 +177,8 @@ function metaTools(names: ReturnType<typeof resolveMetaToolNames>): Tool[] {
     },
     {
       name: names.schema,
-      description: "Get input schemas for facade tools by exact name.",
+      description:
+        "Get the full input schema for unlisted tools found via the search meta-tool (exact fully-qualified <server>__<tool> names), before invoking them with the execute meta-tool.",
       inputSchema: {
         type: "object",
         properties: {
@@ -187,7 +189,8 @@ function metaTools(names: ReturnType<typeof resolveMetaToolNames>): Tool[] {
     },
     {
       name: names.execute,
-      description: "Execute a facade tool by fully-qualified name.",
+      description:
+        "Invoke any unlisted tool by the fully-qualified <server>__<tool> name returned by the search meta-tool. Pass the tool's own arguments in 'arguments' (get them from the schema meta-tool when unsure).",
       inputSchema: {
         type: "object",
         properties: {

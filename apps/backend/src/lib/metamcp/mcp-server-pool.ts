@@ -14,7 +14,10 @@ export interface McpServerPoolStatus {
   activeSessionIds: string[];
   idleServerUuids: string[];
   perServerCounts?: Record<string, number>;
-  maxConnectionsPerServer?: number;
+  // Stdio servers spawn a heavyweight OS process per connection; HTTP/SSE
+  // servers are cheap sockets. The cap is therefore per transport type.
+  maxStdioConnectionsPerServer?: number;
+  maxHttpConnectionsPerServer?: number;
 }
 
 export class McpServerPool {
@@ -60,8 +63,15 @@ export class McpServerPool {
   // Maximum total connections (idle + active) to prevent runaway process spawning
   private readonly maxTotalConnections: number;
 
-  // Maximum connections per individual server UUID (prevents per-server process explosion)
-  private readonly maxConnectionsPerServer: number;
+  // Maximum connections per individual server UUID (prevents per-server process
+  // explosion). Split by transport type: a stdio server spawns a full OS
+  // process per connection (google-ads/gsc/skills each ~150 MB), so its cap is
+  // kept low; an HTTP/SSE server is just a socket, so it can carry many more
+  // concurrent client sessions without memory pressure. A flat cap forced a
+  // trade-off — low enough to stop the stdio OOM starved the cheap HTTP
+  // servers; this lets each type have the ceiling that fits it.
+  private readonly maxStdioConnectionsPerServer: number;
+  private readonly maxHttpConnectionsPerServer: number;
 
   private constructor(
     defaultIdleCount: number = 1,
@@ -69,13 +79,29 @@ export class McpServerPool {
       process.env.MAX_TOTAL_CONNECTIONS || "100",
       10,
     ),
-    maxConnectionsPerServer: number = 5,
+    maxStdioConnectionsPerServer: number = 3,
+    maxHttpConnectionsPerServer: number = 15,
   ) {
     this.defaultIdleCount = defaultIdleCount;
     this.maxTotalConnections = maxTotalConnections;
-    this.maxConnectionsPerServer = maxConnectionsPerServer;
+    this.maxStdioConnectionsPerServer = maxStdioConnectionsPerServer;
+    this.maxHttpConnectionsPerServer = maxHttpConnectionsPerServer;
     this.startCleanupTimer();
     this.startHealthCheckTimer();
+  }
+
+  /**
+   * Resolve the per-server connection cap for a server by its transport type.
+   * Unknown / uncached servers default to the stdio (conservative) cap.
+   */
+  private getMaxConnectionsForServer(serverUuid: string): number {
+    const type = this.serverParamsCache[serverUuid]?.type;
+    // SSE and STREAMABLE_HTTP are cheap sockets; everything else (STDIO or an
+    // as-yet-uncached server) gets the conservative process-spawning cap.
+    if (type === "SSE" || type === "STREAMABLE_HTTP") {
+      return this.maxHttpConnectionsPerServer;
+    }
+    return this.maxStdioConnectionsPerServer;
   }
 
   /**
@@ -83,26 +109,39 @@ export class McpServerPool {
    */
   static getInstance(
     defaultIdleCount: number = 1,
-    maxConnectionsPerServer?: number,
+    maxStdioConnectionsPerServer?: number,
   ): McpServerPool {
     if (!McpServerPool.instance) {
       const envMax = parseInt(process.env.MAX_TOTAL_CONNECTIONS || "", 10);
       const maxConn = Number.isFinite(envMax) && envMax > 0 ? envMax : 100;
-      // Per-server cap is env-configurable too: with several concurrent
-      // client sessions (multiple machines / a connector + a retry loop),
-      // a hard 5 starves later sessions of a slot and surfaces as the
-      // backend "dropping" every few minutes. Default 10; explicit arg wins.
-      const envPerServer = parseInt(
-        process.env.MAX_CONNECTIONS_PER_SERVER || "",
-        10,
-      );
-      const perServer =
-        maxConnectionsPerServer ??
-        (Number.isFinite(envPerServer) && envPerServer > 0 ? envPerServer : 10);
+
+      const parsePositive = (raw: string | undefined): number | undefined => {
+        const n = parseInt(raw || "", 10);
+        return Number.isFinite(n) && n > 0 ? n : undefined;
+      };
+
+      // Stdio cap: a heavyweight OS process per connection, so keep it small.
+      // Resolution order: explicit arg > MAX_STDIO_CONNECTIONS_PER_SERVER >
+      // legacy MAX_CONNECTIONS_PER_SERVER (which historically bounded stdio) >
+      // default 3. Honoring the legacy var keeps existing deployments' safe
+      // stdio bound in place after this upgrade.
+      const stdioCap =
+        maxStdioConnectionsPerServer ??
+        parsePositive(process.env.MAX_STDIO_CONNECTIONS_PER_SERVER) ??
+        parsePositive(process.env.MAX_CONNECTIONS_PER_SERVER) ??
+        3;
+
+      // HTTP/SSE cap: cheap sockets, so a much higher ceiling is fine. This is
+      // deliberately NOT governed by the legacy flat var — the whole point of
+      // the split is to stop that var from throttling HTTP servers.
+      const httpCap =
+        parsePositive(process.env.MAX_HTTP_CONNECTIONS_PER_SERVER) ?? 15;
+
       McpServerPool.instance = new McpServerPool(
         defaultIdleCount,
         maxConn,
-        perServer,
+        stdioCap,
+        httpCap,
       );
     }
     return McpServerPool.instance;
@@ -139,9 +178,10 @@ export class McpServerPool {
    */
   private canCreateConnectionForServer(serverUuid: string): boolean {
     const count = this.countConnectionsForServer(serverUuid);
-    if (count >= this.maxConnectionsPerServer) {
+    const cap = this.getMaxConnectionsForServer(serverUuid);
+    if (count >= cap) {
       logger.warn(
-        `Per-server connection limit reached for ${serverUuid}: ${count}/${this.maxConnectionsPerServer}`,
+        `Per-server connection limit reached for ${serverUuid}: ${count}/${cap}`,
       );
       return false;
     }
@@ -229,7 +269,7 @@ export class McpServerPool {
       const reusable = this.findOldestActiveConnectionForServer(serverUuid);
       if (reusable) {
         logger.info(
-          `Reusing existing connection for server ${serverUuid} (at per-server cap ${this.maxConnectionsPerServer})`,
+          `Reusing existing connection for server ${serverUuid} (at per-server cap ${this.getMaxConnectionsForServer(serverUuid)})`,
         );
         this.activeSessions[sessionId][serverUuid] = reusable;
         this.sessionToServers[sessionId].add(serverUuid);
@@ -294,7 +334,7 @@ export class McpServerPool {
     // (observed 7/5 for i9labs-kanban), leaking connections that never reap.
     if (!this.canCreateConnectionForServer(params.uuid)) {
       logger.warn(
-        `Per-server cap ${this.maxConnectionsPerServer} reached for ${params.name} (${params.uuid}) in createNewConnection; reusing oldest active instead of spawning`,
+        `Per-server cap ${this.getMaxConnectionsForServer(params.uuid)} reached for ${params.name} (${params.uuid}) in createNewConnection; reusing oldest active instead of spawning`,
       );
       return this.findOldestActiveConnectionForServer(params.uuid) ?? undefined;
     }
@@ -635,7 +675,8 @@ export class McpServerPool {
       activeSessionIds: Object.keys(this.activeSessions),
       idleServerUuids: Object.keys(this.idleSessions),
       perServerCounts,
-      maxConnectionsPerServer: this.maxConnectionsPerServer,
+      maxStdioConnectionsPerServer: this.maxStdioConnectionsPerServer,
+      maxHttpConnectionsPerServer: this.maxHttpConnectionsPerServer,
     };
   }
 

@@ -111,7 +111,7 @@ async function getToolStatus(
     // Query database for tool status
     const [toolMapping] = await db
       .select({
-        status: namespaceToolMappingsTable.status,
+        status: namespaceToolMappingsTable.exposure_mode,
       })
       .from(namespaceToolMappingsTable)
       .innerJoin(
@@ -126,7 +126,11 @@ async function getToolStatus(
         ),
       );
 
-    const status = toolMapping?.status || null;
+    const status = toolMapping
+      ? toolMapping.status === "HIDDEN"
+        ? "INACTIVE"
+        : "ACTIVE"
+      : null;
 
     // Cache the result if found and caching is enabled
     if (status && useCache) {

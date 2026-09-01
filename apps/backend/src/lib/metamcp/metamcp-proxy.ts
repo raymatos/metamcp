@@ -43,6 +43,10 @@ import { requestWithSessionRecovery } from "./list-handler-recovery";
 import { mcpServerPool } from "./mcp-server-pool";
 import { createAuditCallToolMiddleware } from "./metamcp-middleware/audit-requests.functional";
 import {
+  createFacadeCallToolMiddleware,
+  createFacadeListToolsMiddleware,
+} from "./metamcp-middleware/facade.functional";
+import {
   createFilterCallToolMiddleware,
   createFilterListToolsMiddleware,
 } from "./metamcp-middleware/filter-tools.functional";
@@ -703,6 +707,9 @@ export const createServer = async (
 
   // Compose middleware with handlers - this is the Express-like functional approach
   const listToolsWithMiddleware = compose(
+    createFacadeListToolsMiddleware({
+      enabled: namespace?.facade_enabled ?? false,
+    }),
     createToolOverridesListToolsMiddleware({
       cacheEnabled: true,
       persistentCacheOnListTools: true,
@@ -714,6 +721,9 @@ export const createServer = async (
   )(originalListToolsHandler);
 
   const callToolWithMiddleware = compose(
+    createFacadeCallToolMiddleware({
+      enabled: namespace?.facade_enabled ?? false,
+    }),
     createAuditCallToolMiddleware({ resolveToolIdentity }),
     createFilterCallToolMiddleware({
       cacheEnabled: true,

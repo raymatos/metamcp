@@ -16,6 +16,7 @@ export class NamespacesSerializer {
       created_at: dbNamespace.created_at.toISOString(),
       updated_at: dbNamespace.updated_at.toISOString(),
       user_id: dbNamespace.user_id,
+      facade_enabled: dbNamespace.facade_enabled,
     };
   }
 
@@ -35,6 +36,7 @@ export class NamespacesSerializer {
       created_at: dbNamespace.created_at.toISOString(),
       updated_at: dbNamespace.updated_at.toISOString(),
       user_id: dbNamespace.user_id,
+      facade_enabled: dbNamespace.facade_enabled,
       servers: dbNamespace.servers.map((server) => ({
         uuid: server.uuid,
         name: server.name,
@@ -65,6 +67,7 @@ export class NamespacesSerializer {
       updated_at: dbTool.updated_at.toISOString(),
       mcp_server_uuid: dbTool.mcp_server_uuid,
       status: dbTool.status,
+      exposureMode: dbTool.exposureMode,
       serverName: dbTool.serverName,
       serverUuid: dbTool.serverUuid,
       overrideName: dbTool.overrideName,

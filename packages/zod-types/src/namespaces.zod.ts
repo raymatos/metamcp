@@ -7,6 +7,8 @@ import {
 } from "./mcp-servers.zod";
 import { ToolSchema, ToolStatusEnum } from "./tools.zod";
 
+export const ToolExposureModeEnum = z.enum(["DIRECT", "FACADE", "HIDDEN"]);
+
 const ToolAnnotationsSchema = z.record(z.string(), z.unknown());
 
 // Namespace schema definitions
@@ -42,6 +44,7 @@ export const NamespaceSchema = z.object({
   created_at: z.string(),
   updated_at: z.string(),
   user_id: z.string().nullable(),
+  facade_enabled: z.boolean().optional(),
 });
 
 // Server within namespace schema - extends McpServerSchema with namespace-specific status
@@ -55,6 +58,7 @@ export const NamespaceToolSchema = ToolSchema.extend({
   serverName: z.string(),
   serverUuid: z.string(),
   status: ToolStatusEnum, // Status from namespace tool mapping
+  exposureMode: ToolExposureModeEnum.optional(),
   overrideName: z.string().nullable().optional(),
   overrideTitle: z.string().nullable().optional(),
   overrideDescription: z.string().nullable().optional(),
@@ -289,6 +293,7 @@ export const DatabaseNamespaceSchema = z.object({
   created_at: z.date(),
   updated_at: z.date(),
   user_id: z.string().nullable(),
+  facade_enabled: z.boolean().optional(),
 });
 
 export const DatabaseNamespaceServerSchema = z.object({
@@ -326,6 +331,7 @@ export const DatabaseNamespaceToolSchema = z.object({
   updated_at: z.date(),
   mcp_server_uuid: z.string(),
   status: ToolStatusEnum,
+  exposureMode: ToolExposureModeEnum.optional(),
   serverName: z.string(),
   serverUuid: z.string(),
   overrideName: z.string().nullable().optional(),

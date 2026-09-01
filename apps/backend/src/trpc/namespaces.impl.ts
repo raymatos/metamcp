@@ -853,7 +853,6 @@ export const namespacesImplementations = {
         const toolMappings = upsertedTools.map((tool) => ({
           toolUuid: tool.uuid,
           serverUuid: serverUuid,
-          status: "ACTIVE" as const,
         }));
 
         const createdMappings =

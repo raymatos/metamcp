@@ -8,7 +8,10 @@ import { z } from "zod";
 
 import logger from "@/utils/logger";
 
-import { toolsRepository } from "../db/repositories";
+import {
+  namespaceMappingsRepository,
+  toolsRepository,
+} from "../db/repositories";
 import { ToolsSerializer } from "../db/serializers";
 import { toolsSyncCache } from "../lib/metamcp/tools-sync-cache";
 
@@ -100,6 +103,22 @@ export const toolsImplementations = {
           tools: input.tools,
           mcpServerUuid: input.mcpServerUuid,
         });
+
+        const namespaceUuids =
+          await namespaceMappingsRepository.findNamespacesByServerUuid(
+            input.mcpServerUuid,
+          );
+        await Promise.all(
+          namespaceUuids.map((namespaceUuid) =>
+            namespaceMappingsRepository.bulkUpsertNamespaceToolMappings({
+              namespaceUuid,
+              toolMappings: upserted.map((tool) => ({
+                toolUuid: tool.uuid,
+                serverUuid: input.mcpServerUuid,
+              })),
+            }),
+          ),
+        );
 
         const message =
           deleted.length > 0

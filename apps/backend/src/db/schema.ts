@@ -42,6 +42,11 @@ export const mcpRequestAuditStatusEnum = pgEnum("mcp_request_audit_status", [
   "SUCCESS",
   "ERROR",
 ]);
+export const toolExposureModeEnum = pgEnum("tool_exposure_mode", [
+  "DIRECT",
+  "FACADE",
+  "HIDDEN",
+]);
 
 export const mcpServersTable = pgTable(
   "mcp_servers",
@@ -255,6 +260,7 @@ export const namespacesTable = pgTable(
     user_id: text("user_id").references(() => usersTable.id, {
       onDelete: "cascade",
     }),
+    facade_enabled: boolean("facade_enabled").notNull().default(false),
   },
   (table) => [
     index("namespaces_user_id_idx").on(table.user_id),
@@ -362,9 +368,9 @@ export const namespaceToolMappingsTable = pgTable(
     mcp_server_uuid: uuid("mcp_server_uuid")
       .notNull()
       .references(() => mcpServersTable.uuid, { onDelete: "cascade" }),
-    status: mcpServerStatusEnum("status")
+    exposure_mode: toolExposureModeEnum("exposure_mode")
       .notNull()
-      .default(McpServerStatusEnum.enum.ACTIVE),
+      .default("DIRECT"),
     override_name: text("override_name"),
     override_title: text("override_title"),
     override_description: text("override_description"),
@@ -383,7 +389,7 @@ export const namespaceToolMappingsTable = pgTable(
     index("namespace_tool_mappings_mcp_server_uuid_idx").on(
       table.mcp_server_uuid,
     ),
-    index("namespace_tool_mappings_status_idx").on(table.status),
+    index("namespace_tool_mappings_exposure_mode_idx").on(table.exposure_mode),
     unique("namespace_tool_mappings_unique_idx").on(
       table.namespace_uuid,
       table.tool_uuid,

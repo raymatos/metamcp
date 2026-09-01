@@ -5,7 +5,7 @@ import {
   NamespaceCreateInput,
   NamespaceUpdateInput,
 } from "@repo/zod-types";
-import { and, desc, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 
 import { db } from "../index";
 import {
@@ -27,6 +27,7 @@ export class NamespacesRepository {
           name: input.name,
           description: input.description,
           user_id: input.user_id,
+          facade_enabled: false,
         })
         .returning();
 
@@ -58,7 +59,7 @@ export class NamespacesRepository {
             namespace_uuid: createdNamespace.uuid,
             tool_uuid: tool.uuid,
             mcp_server_uuid: tool.mcp_server_uuid,
-            status: "ACTIVE" as const,
+            exposure_mode: "DIRECT" as const,
           }));
 
           await tx.insert(namespaceToolMappingsTable).values(toolMappings);
@@ -78,6 +79,7 @@ export class NamespacesRepository {
         created_at: namespacesTable.created_at,
         updated_at: namespacesTable.updated_at,
         user_id: namespacesTable.user_id,
+        facade_enabled: namespacesTable.facade_enabled,
       })
       .from(namespacesTable)
       .orderBy(desc(namespacesTable.created_at));
@@ -93,6 +95,7 @@ export class NamespacesRepository {
         created_at: namespacesTable.created_at,
         updated_at: namespacesTable.updated_at,
         user_id: namespacesTable.user_id,
+        facade_enabled: namespacesTable.facade_enabled,
       })
       .from(namespacesTable)
       .where(
@@ -114,6 +117,7 @@ export class NamespacesRepository {
         created_at: namespacesTable.created_at,
         updated_at: namespacesTable.updated_at,
         user_id: namespacesTable.user_id,
+        facade_enabled: namespacesTable.facade_enabled,
       })
       .from(namespacesTable)
       .where(isNull(namespacesTable.user_id))
@@ -130,6 +134,7 @@ export class NamespacesRepository {
         created_at: namespacesTable.created_at,
         updated_at: namespacesTable.updated_at,
         user_id: namespacesTable.user_id,
+        facade_enabled: namespacesTable.facade_enabled,
       })
       .from(namespacesTable)
       .where(eq(namespacesTable.user_id, userId))
@@ -145,6 +150,7 @@ export class NamespacesRepository {
         created_at: namespacesTable.created_at,
         updated_at: namespacesTable.updated_at,
         user_id: namespacesTable.user_id,
+        facade_enabled: namespacesTable.facade_enabled,
       })
       .from(namespacesTable)
       .where(eq(namespacesTable.uuid, uuid));
@@ -165,6 +171,7 @@ export class NamespacesRepository {
         created_at: namespacesTable.created_at,
         updated_at: namespacesTable.updated_at,
         user_id: namespacesTable.user_id,
+        facade_enabled: namespacesTable.facade_enabled,
       })
       .from(namespacesTable)
       .where(
@@ -258,7 +265,10 @@ export class NamespacesRepository {
         serverName: mcpServersTable.name,
         serverUuid: mcpServersTable.uuid,
         // Namespace mapping fields
-        status: namespaceToolMappingsTable.status,
+        status: sql<
+          "ACTIVE" | "INACTIVE"
+        >`case when ${namespaceToolMappingsTable.exposure_mode} = 'HIDDEN' then 'INACTIVE' else 'ACTIVE' end`,
+        exposureMode: namespaceToolMappingsTable.exposure_mode,
         overrideName: namespaceToolMappingsTable.override_name,
         overrideTitle: namespaceToolMappingsTable.override_title,
         overrideDescription: namespaceToolMappingsTable.override_description,
@@ -313,11 +323,14 @@ export class NamespacesRepository {
           await namespaceMappingsRepository.findToolMappingsByNamespace(
             input.uuid,
           );
-        const existingToolStatusMap = new Map<string, "ACTIVE" | "INACTIVE">();
+        const existingExposureModeMap = new Map<
+          string,
+          "DIRECT" | "FACADE" | "HIDDEN"
+        >();
 
         // Create a map of existing tool statuses by tool_uuid
         existingToolMappings.forEach((mapping) => {
-          existingToolStatusMap.set(mapping.tool_uuid, mapping.status);
+          existingExposureModeMap.set(mapping.tool_uuid, mapping.exposure_mode);
         });
 
         // Delete existing server mappings
@@ -355,8 +368,8 @@ export class NamespacesRepository {
               tool_uuid: tool.uuid,
               mcp_server_uuid: tool.mcp_server_uuid,
               // Preserve existing status if tool was previously mapped, otherwise default to ACTIVE
-              status:
-                existingToolStatusMap.get(tool.uuid) || ("ACTIVE" as const),
+              exposure_mode:
+                existingExposureModeMap.get(tool.uuid) || ("DIRECT" as const),
             }));
 
             await tx.insert(namespaceToolMappingsTable).values(toolMappings);

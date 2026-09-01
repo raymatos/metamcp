@@ -551,6 +551,32 @@ export class McpServerPool {
   }
 
   /**
+   * A ConnectedClient can be SHARED across sessions: the at-cap paths in
+   * getSession/createNewConnection hand the same instance to multiple
+   * sessionIds instead of spawning past the per-server cap. A client another
+   * live session still holds must never be recycled to idle (a third session
+   * would convert it while it's in use) or destroyed (the surviving session's
+   * next call dies on a dead transport — observed as "Backend connection
+   * lost ... retrying once" floods when the reaper expires one of the
+   * sharing sessions). The last session to release it recycles/destroys it.
+   */
+  private isClientHeldByOtherSessions(
+    sessionId: string,
+    serverUuid: string,
+    client: ConnectedClient,
+  ): boolean {
+    for (const [otherSessionId, servers] of Object.entries(
+      this.activeSessions,
+    )) {
+      if (otherSessionId === sessionId) continue;
+      if (servers[serverUuid] === client) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Cleanup a session by sessionId.
    * Recycles healthy connections back to the idle pool instead of destroying them.
    */
@@ -562,9 +588,15 @@ export class McpServerPool {
 
     let recycled = 0;
     let destroyed = 0;
+    let shared = 0;
 
     // Try to recycle each connection back to idle pool
     for (const [serverUuid, client] of Object.entries(activeSession)) {
+      if (this.isClientHeldByOtherSessions(sessionId, serverUuid, client)) {
+        // Another live session shares this client — just drop our reference.
+        shared++;
+        continue;
+      }
       if (!this.idleSessions[serverUuid]) {
         // No idle session for this server — recycle the connection
         this.idleSessions[serverUuid] = client;
@@ -596,7 +628,7 @@ export class McpServerPool {
     delete this.sessionToServers[sessionId];
 
     logger.info(
-      `Cleaned up session ${sessionId} (recycled: ${recycled}, destroyed: ${destroyed})`,
+      `Cleaned up session ${sessionId} (recycled: ${recycled}, destroyed: ${destroyed}, shared-skipped: ${shared})`,
     );
   }
 

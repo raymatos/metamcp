@@ -148,6 +148,97 @@ describe("facade middleware", () => {
     });
   });
 
+  it("parses a JSON-string 'arguments' payload instead of forwarding {}", async () => {
+    const inner = vi.fn().mockResolvedValue({ content: [] });
+    const request: CallToolRequest = {
+      method: "tools/call",
+      params: {
+        name: "mcp_execute_tool",
+        arguments: {
+          name: "alpha__find",
+          arguments: JSON.stringify({ value: "x" }),
+        },
+      },
+    };
+    await createFacadeCallToolMiddleware({
+      enabled: true,
+      loadTools: vi.fn().mockResolvedValue(records),
+    })(inner)(request, context);
+    expect(inner.mock.calls[0]?.[0].params.arguments).toEqual({ value: "x" });
+  });
+
+  it("rejects an unparseable string 'arguments' loudly without calling the backend", async () => {
+    const inner = vi.fn();
+    const request: CallToolRequest = {
+      method: "tools/call",
+      params: {
+        name: "mcp_execute_tool",
+        arguments: { name: "alpha__find", arguments: "not json {" },
+      },
+    };
+    const result = await createFacadeCallToolMiddleware({
+      enabled: true,
+      loadTools: vi.fn().mockResolvedValue(records),
+    })(inner)(request, context);
+    expect(result.isError).toBe(true);
+    expect(inner).not.toHaveBeenCalled();
+  });
+
+  it("coerces string-typed primitives to the target tool's declared types", async () => {
+    const typedRecords: FacadeToolRecord[] = [
+      {
+        name: "alpha__typed",
+        originalName: "alpha__typed",
+        server: "alpha",
+        exposureMode: "FACADE",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            limit: { type: "integer" },
+            ratio: { type: "number" },
+            active: { type: "boolean" },
+            label: { type: "string" },
+            nested: {
+              type: "object",
+              properties: { count: { type: "integer" } },
+            },
+            ids: { type: "array", items: { type: "integer" } },
+          },
+        },
+      },
+    ];
+    const inner = vi.fn().mockResolvedValue({ content: [] });
+    const request: CallToolRequest = {
+      method: "tools/call",
+      params: {
+        name: "mcp_execute_tool",
+        arguments: {
+          name: "alpha__typed",
+          arguments: {
+            limit: "5",
+            ratio: "0.5",
+            active: "true",
+            label: "7", // string-typed prop must NOT be coerced
+            nested: JSON.stringify({ count: "3" }), // stringified object + inner coercion
+            ids: ["1", "2"],
+          },
+        },
+      },
+    };
+    await createFacadeCallToolMiddleware({
+      enabled: true,
+      loadTools: vi.fn().mockResolvedValue(typedRecords),
+    })(inner)(request, context);
+    expect(inner.mock.calls[0]?.[0].params.arguments).toEqual({
+      limit: 5,
+      ratio: 0.5,
+      active: true,
+      label: "7",
+      nested: { count: 3 },
+      ids: [1, 2],
+    });
+  });
+
   it("blocks HIDDEN and unknown execute targets", async () => {
     const inner = vi.fn();
     const request: CallToolRequest = {

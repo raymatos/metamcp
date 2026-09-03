@@ -190,7 +190,7 @@ function metaTools(names: ReturnType<typeof resolveMetaToolNames>): Tool[] {
     {
       name: names.execute,
       description:
-        "Invoke any unlisted tool by the fully-qualified <server>__<tool> name returned by the search meta-tool. Pass the tool's own arguments in 'arguments' (get them from the schema meta-tool when unsure).",
+        "Invoke any unlisted tool by the fully-qualified <server>__<tool> name returned by the search meta-tool. Pass the tool's own arguments as a JSON OBJECT in 'arguments' (get the schema from the schema meta-tool when unsure). A JSON-encoded string is tolerated and parsed; string-typed numbers/booleans are coerced to the tool's declared types.",
       inputSchema: {
         type: "object",
         properties: {
@@ -208,6 +208,117 @@ function textResult(value: unknown, isError = false) {
     content: [{ type: "text" as const, text: JSON.stringify(value) }],
     ...(isError ? { isError: true } : {}),
   };
+}
+
+/**
+ * The nested `arguments` of execute_tool is opaque to the CLIENT: unlike a
+ * first-class tool call, no client-side schema validation or type coercion
+ * happens before it reaches us. Models routinely (a) pass the whole object as
+ * a JSON-encoded string and (b) pass numbers/booleans as strings. Both used
+ * to land raw on the backend — (a) was silently forwarded as {} ("required
+ * arg missing" on every facade tool), (b) failed strict backends with
+ * "Expected number, received string". Be liberal here: parse stringified
+ * objects and coerce string primitives against the target tool's own schema.
+ */
+function parseExecuteArguments(
+  raw: unknown,
+): { ok: true; value: Record<string, unknown> } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true, value: {} };
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return { ok: true, value: parsed as Record<string, unknown> };
+      }
+      return {
+        ok: false,
+        error: `'arguments' must be a JSON object; the provided string parsed to ${Array.isArray(parsed) ? "an array" : typeof parsed}`,
+      };
+    } catch {
+      return {
+        ok: false,
+        error:
+          "'arguments' must be a JSON object; got a string that is not valid JSON",
+      };
+    }
+  }
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    return { ok: true, value: raw as Record<string, unknown> };
+  }
+  return {
+    ok: false,
+    error: `'arguments' must be a JSON object; got ${Array.isArray(raw) ? "an array" : typeof raw}`,
+  };
+}
+
+type JsonSchemaLike = {
+  type?: string | string[];
+  properties?: Record<string, JsonSchemaLike>;
+  items?: JsonSchemaLike;
+};
+
+function schemaType(schema: JsonSchemaLike | undefined): string | undefined {
+  if (!schema?.type) return undefined;
+  if (typeof schema.type === "string") return schema.type;
+  // ["number","null"] and friends: coerce toward the first non-null type.
+  return schema.type.find((t) => t !== "null");
+}
+
+function coerceBySchema(value: unknown, schema: JsonSchemaLike | undefined): unknown {
+  if (!schema) return value;
+  const type = schemaType(schema);
+
+  if (typeof value === "string") {
+    if (type === "integer" || type === "number") {
+      const trimmed = value.trim();
+      if (/^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(trimmed)) {
+        const n = Number(trimmed);
+        if (Number.isFinite(n) && (type !== "integer" || Number.isInteger(n))) {
+          return n;
+        }
+      }
+      return value;
+    }
+    if (type === "boolean") {
+      if (value === "true") return true;
+      if (value === "false") return false;
+      return value;
+    }
+    if (type === "object" || type === "array") {
+      try {
+        const parsed = JSON.parse(value);
+        if (
+          (type === "object" &&
+            parsed &&
+            typeof parsed === "object" &&
+            !Array.isArray(parsed)) ||
+          (type === "array" && Array.isArray(parsed))
+        ) {
+          return coerceBySchema(parsed, schema);
+        }
+      } catch {
+        /* leave as-is; backend reports the real error */
+      }
+      return value;
+    }
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return schema.items
+      ? value.map((item) => coerceBySchema(item, schema.items))
+      : value;
+  }
+
+  if (value && typeof value === "object" && schema.properties) {
+    const out: Record<string, unknown> = {};
+    for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = coerceBySchema(v, schema.properties[key]);
+    }
+    return out;
+  }
+
+  return value;
 }
 
 export function createFacadeListToolsMiddleware(
@@ -261,15 +372,20 @@ export function createFacadeCallToolMiddleware(
           true,
         );
       }
+      const parsed = parseExecuteArguments(args.arguments);
+      if (!parsed.ok) {
+        return textResult({ error: parsed.error }, true);
+      }
+      const coerced = coerceBySchema(
+        parsed.value,
+        target.inputSchema as JsonSchemaLike,
+      ) as Record<string, unknown>;
       const rewritten: CallToolRequest = {
         ...request,
         params: {
           ...request.params,
           name: target.name,
-          arguments:
-            args.arguments && typeof args.arguments === "object"
-              ? (args.arguments as Record<string, unknown>)
-              : {},
+          arguments: coerced,
         },
       };
       return handler(rewritten, context);

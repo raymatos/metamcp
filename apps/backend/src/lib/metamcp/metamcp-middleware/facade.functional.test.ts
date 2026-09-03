@@ -167,6 +167,25 @@ describe("facade middleware", () => {
     expect(inner.mock.calls[0]?.[0].params.arguments).toEqual({ value: "x" });
   });
 
+  it("tolerates a double-stringified 'arguments' payload", async () => {
+    const inner = vi.fn().mockResolvedValue({ content: [] });
+    const request: CallToolRequest = {
+      method: "tools/call",
+      params: {
+        name: "mcp_execute_tool",
+        arguments: {
+          name: "alpha__find",
+          arguments: JSON.stringify(JSON.stringify({ value: "x" })),
+        },
+      },
+    };
+    await createFacadeCallToolMiddleware({
+      enabled: true,
+      loadTools: vi.fn().mockResolvedValue(records),
+    })(inner)(request, context);
+    expect(inner.mock.calls[0]?.[0].params.arguments).toEqual({ value: "x" });
+  });
+
   it("rejects an unparseable string 'arguments' loudly without calling the backend", async () => {
     const inner = vi.fn();
     const request: CallToolRequest = {

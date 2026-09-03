@@ -226,7 +226,12 @@ function parseExecuteArguments(
   if (raw === undefined || raw === null) return { ok: true, value: {} };
   if (typeof raw === "string") {
     try {
-      const parsed = JSON.parse(raw);
+      let parsed: unknown = JSON.parse(raw);
+      // Tolerate one extra level of encoding: some clients double-stringify,
+      // so the first parse yields the JSON text rather than the object.
+      if (typeof parsed === "string") {
+        parsed = JSON.parse(parsed);
+      }
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         return { ok: true, value: parsed as Record<string, unknown> };
       }

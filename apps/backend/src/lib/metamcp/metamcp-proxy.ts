@@ -499,40 +499,55 @@ export const createServer = async (
               params.name || session.client.getServerVersion()?.name || "";
 
             if (sanitizeName(serverName) === serverPrefix) {
-              // Found the server, now check if it has this tool with pagination
+              // Found the server, now check if it has this tool with pagination.
+              // The verification fetch MUST go through session recovery: since
+              // the facade serves tools/list from the DB, this fallback is the
+              // hot path for a fresh session's first DIRECT call, and a stale
+              // pooled session or expired upstream OAuth token here used to
+              // surface as "Unknown tool" (observed live with i9labs-kanban's
+              // hourly token: bare 401 -> log -> continue -> unknown).
               try {
-                let foundTool = false;
-                let cursor: string | undefined = undefined;
-                let hasMore = true;
+                let activeSession = session;
+                const serverTools = await requestWithSessionRecovery({
+                  pool: mcpServerPool,
+                  sessionId,
+                  serverUuid: mcpServerUuid,
+                  params: effectiveParams,
+                  namespaceUuid,
+                  operation: `tools/list (resolving ${name})`,
+                  serverName,
+                  session,
+                  attempt: async (active) => {
+                    const pages: Tool[] = [];
+                    let cursor: string | undefined = undefined;
+                    let hasMore = true;
+                    while (hasMore) {
+                      const result: ListToolsResult =
+                        await active.client.request(
+                          { method: "tools/list", params: { cursor } },
+                          ListToolsResultSchema,
+                        );
+                      if (result.tools?.length) pages.push(...result.tools);
+                      cursor = result.nextCursor;
+                      hasMore = !!result.nextCursor;
+                    }
+                    return pages;
+                  },
+                  onFreshSession: (fresh) => {
+                    activeSession = fresh;
+                  },
+                });
 
-                while (hasMore && !foundTool) {
-                  const result: ListToolsResult = await session.client.request(
-                    {
-                      method: "tools/list",
-                      params: { cursor: cursor },
-                    },
-                    ListToolsResultSchema,
-                  );
-
-                  if (
-                    result.tools?.some(
-                      (tool: Tool) => tool.name === originalToolName,
-                    )
-                  ) {
-                    foundTool = true;
-                    // Tool exists, populate mappings for future use and use it
-                    clientForTool = session;
-                    serverUuid = mcpServerUuid;
-                    toolToClient[name] = session;
-                    toolToServerUuid[name] = mcpServerUuid;
-                    break;
-                  }
-
-                  cursor = result.nextCursor;
-                  hasMore = !!result.nextCursor;
-                }
-
-                if (foundTool) {
+                if (
+                  serverTools.some(
+                    (tool: Tool) => tool.name === originalToolName,
+                  )
+                ) {
+                  // Tool exists, populate mappings for future use and use it
+                  clientForTool = activeSession;
+                  serverUuid = mcpServerUuid;
+                  toolToClient[name] = activeSession;
+                  toolToServerUuid[name] = mcpServerUuid;
                   break;
                 }
               } catch (error) {

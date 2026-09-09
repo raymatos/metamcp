@@ -42,6 +42,13 @@ export class McpServerPool {
   // Track ongoing idle session creation to prevent duplicates
   private creatingIdleSessions: Set<string> = new Set();
 
+  // Connection slots reserved between passing the cap check and the spawn
+  // completing. Without this the check is a TOCTOU race: a tools/list fans out
+  // to every server at once, so many callers pass `canCreateConnectionForServer`
+  // before any of them has registered a client, and each then spawns — which is
+  // how single-instance stdio servers reached ~9 processes against a cap of 4.
+  private pendingConnections: Record<string, number> = {};
+
   // Generation counter per server UUID: incremented by invalidateIdleSession() so
   // any in-flight createIdleSession / createIdleSessionAsync that resolves with a
   // stale generation knows to discard its result instead of storing it.
@@ -151,26 +158,55 @@ export class McpServerPool {
    * Count all connections (idle + active + pending) for a specific server UUID
    */
   private countConnectionsForServer(serverUuid: string): number {
-    let count = 0;
+    // Count DISTINCT ConnectedClient instances, not session references. The
+    // at-cap reuse paths hand the SAME client to many sessionIds, so counting
+    // references inflated without bound as sessions accumulated (observed
+    // 76/4 for servers holding a handful of real connections). That inflation
+    // propagated into the global ceiling and eventually refused every new
+    // connection namespace-wide.
+    const distinct = new Set<ConnectedClient>();
 
-    // Count idle session
-    if (this.idleSessions[serverUuid]) {
-      count += 1;
+    const idleClient = this.idleSessions[serverUuid];
+    if (idleClient) {
+      distinct.add(idleClient);
     }
 
-    // Count active sessions across all sessionIds
     for (const sessionServers of Object.values(this.activeSessions)) {
-      if (sessionServers[serverUuid]) {
-        count += 1;
+      const client = sessionServers[serverUuid];
+      if (client) {
+        distinct.add(client);
       }
     }
+
+    let count = distinct.size;
 
     // Count pending idle creation
     if (this.creatingIdleSessions.has(serverUuid)) {
       count += 1;
     }
 
+    // Count slots reserved by in-flight spawns that have not registered yet
+    count += this.pendingConnections[serverUuid] ?? 0;
+
     return count;
+  }
+
+  /**
+   * Reserve a connection slot for the duration of an in-flight spawn so that
+   * concurrent callers see it in the cap counts. Always released in a finally.
+   */
+  private reserveConnectionSlot(serverUuid: string): void {
+    this.pendingConnections[serverUuid] =
+      (this.pendingConnections[serverUuid] ?? 0) + 1;
+  }
+
+  private releaseConnectionSlot(serverUuid: string): void {
+    const next = (this.pendingConnections[serverUuid] ?? 0) - 1;
+    if (next > 0) {
+      this.pendingConnections[serverUuid] = next;
+    } else {
+      delete this.pendingConnections[serverUuid];
+    }
   }
 
   /**
@@ -339,56 +375,65 @@ export class McpServerPool {
       return this.findOldestActiveConnectionForServer(params.uuid) ?? undefined;
     }
 
-    logger.info(
-      `Creating new connection for server ${params.name} (${params.uuid}) with namespace: ${namespaceUuid || "none"}`,
-    );
-    metamcpLogStore.addLog(
-      params.name,
-      "info",
-      `Creating new connection for namespace ${namespaceUuid || "none"}`,
-    );
+    // Reserve the slot BEFORE the await so concurrent callers see it in the
+    // cap counts. The spawn can take seconds (uvx/npx cold fetch) and a
+    // tools/list fans out to every server at once, so without this the checks
+    // above are a TOCTOU race and several callers each spawn a process.
+    this.reserveConnectionSlot(params.uuid);
+    try {
+      logger.info(
+        `Creating new connection for server ${params.name} (${params.uuid}) with namespace: ${namespaceUuid || "none"}`,
+      );
+      metamcpLogStore.addLog(
+        params.name,
+        "info",
+        `Creating new connection for namespace ${namespaceUuid || "none"}`,
+      );
 
-    const connectedClient = await connectMetaMcpClient(
-      params,
-      (exitCode, signal) => {
-        logger.info(
-          `Crash handler callback called for server ${params.name} (${params.uuid}) with namespace: ${namespaceUuid || "none"}`,
-        );
+      const connectedClient = await connectMetaMcpClient(
+        params,
+        (exitCode, signal) => {
+          logger.info(
+            `Crash handler callback called for server ${params.name} (${params.uuid}) with namespace: ${namespaceUuid || "none"}`,
+          );
 
-        // Handle process crash - always set up crash handler
-        if (namespaceUuid) {
-          // If we have a namespace context, use it
-          this.handleServerCrash(
-            params.uuid,
-            namespaceUuid,
-            exitCode,
-            signal,
-          ).catch((error) => {
-            logger.error(
-              `Error handling server crash for ${params.uuid} in ${namespaceUuid}:`,
-              error,
-            );
-          });
-        } else {
-          // If no namespace context, still track the crash globally
-          this.handleServerCrashWithoutNamespace(
-            params.uuid,
-            exitCode,
-            signal,
-          ).catch((error) => {
-            logger.error(
-              `Error handling server crash for ${params.uuid} (no namespace):`,
-              error,
-            );
-          });
-        }
-      },
-    );
-    if (!connectedClient) {
-      return undefined;
+          // Handle process crash - always set up crash handler
+          if (namespaceUuid) {
+            // If we have a namespace context, use it
+            this.handleServerCrash(
+              params.uuid,
+              namespaceUuid,
+              exitCode,
+              signal,
+            ).catch((error) => {
+              logger.error(
+                `Error handling server crash for ${params.uuid} in ${namespaceUuid}:`,
+                error,
+              );
+            });
+          } else {
+            // If no namespace context, still track the crash globally
+            this.handleServerCrashWithoutNamespace(
+              params.uuid,
+              exitCode,
+              signal,
+            ).catch((error) => {
+              logger.error(
+                `Error handling server crash for ${params.uuid} (no namespace):`,
+                error,
+              );
+            });
+          }
+        },
+      );
+      if (!connectedClient) {
+        return undefined;
+      }
+
+      return connectedClient;
+    } finally {
+      this.releaseConnectionSlot(params.uuid);
     }
-
-    return connectedClient;
   }
 
   /**
@@ -716,14 +761,27 @@ export class McpServerPool {
    * Get total connection count (idle + active + pending)
    */
   private getTotalConnectionCount(): number {
-    const idle = Object.keys(this.idleSessions).length;
-    const active = Object.keys(this.activeSessions).reduce(
-      (total, sessionId) =>
-        total + Object.keys(this.activeSessions[sessionId]).length,
+    // Distinct clients, for the same reason as countConnectionsForServer: a
+    // client shared across N sessions is ONE connection, not N. Counting
+    // references made the global ceiling scale with session count rather than
+    // with real connections and starved every server once enough sessions
+    // were live.
+    const distinct = new Set<ConnectedClient>();
+
+    for (const client of Object.values(this.idleSessions)) {
+      distinct.add(client);
+    }
+    for (const sessionServers of Object.values(this.activeSessions)) {
+      for (const client of Object.values(sessionServers)) {
+        distinct.add(client);
+      }
+    }
+
+    const reserved = Object.values(this.pendingConnections).reduce(
+      (sum, n) => sum + n,
       0,
     );
-    const pending = this.creatingIdleSessions.size;
-    return idle + active + pending;
+    return distinct.size + this.creatingIdleSessions.size + reserved;
   }
 
   /**

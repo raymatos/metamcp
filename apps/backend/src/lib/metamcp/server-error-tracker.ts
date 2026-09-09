@@ -130,6 +130,18 @@ export class ServerErrorTracker {
   }
 
   /**
+   * Flag a server as needing a human re-authorization.
+   *
+   * Distinct in intent from a crash even though it reuses the ERROR status:
+   * nothing here will self-heal, because the upstream permanently rejected the
+   * refresh token. Reusing ERROR means it shows red in the existing UI with no
+   * schema change; the accompanying log line carries the actionable detail.
+   */
+  async markServerNeedsReauth(serverUuid: string): Promise<void> {
+    await this.markServerAsError(serverUuid);
+  }
+
+  /**
    * Reset crash attempts for a server (e.g., after successful recovery)
    */
   resetServerAttempts(serverUuid: string): void {

@@ -11,6 +11,10 @@ vi.mock("../../utils/logger", () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
+vi.mock("../metamcp/server-error-tracker", () => ({
+  serverErrorTracker: { markServerNeedsReauth: vi.fn() },
+}));
+
 const jsonResponse = (status: number, body: unknown): Response =>
   new Response(JSON.stringify(body), {
     status,
@@ -32,11 +36,28 @@ describe("tryRefreshUpstreamTokens", () => {
       findByMcpServerUuid: repos.oauthSessionsRepository
         .findByMcpServerUuid as ReturnType<typeof vi.fn>,
       upsert: repos.oauthSessionsRepository.upsert as ReturnType<typeof vi.fn>,
+      isReauthRequired: mod.isReauthRequired,
+      resetReauthState: mod._resetReauthState,
     };
   };
 
-  beforeEach(() => {
+  const sessionWithRefreshToken = (refreshToken: string) => ({
+    mcp_server_uuid: SERVER.uuid,
+    client_information: {
+      client_id: "c1",
+      token_endpoint: "https://upstream/token",
+    },
+    tokens: {
+      access_token: "OLD",
+      token_type: "Bearer",
+      refresh_token: refreshToken,
+    },
+  });
+
+  beforeEach(async () => {
     vi.clearAllMocks();
+    const { resetReauthState } = await loadModule();
+    resetReauthState();
   });
   afterEach(() => {
     vi.restoreAllMocks();
@@ -218,23 +239,27 @@ describe("tryRefreshUpstreamTokens", () => {
       code_verifier: null,
     });
 
-    vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
-      const urlStr = typeof url === "string" ? url : (url as URL).toString();
-      if (urlStr.includes("/.well-known/"))
-        return new Response("nope", { status: 404 });
-      return jsonResponse(400, {
-        error: "invalid_grant",
+    // Deliberately a TRANSIENT upstream error: `invalid_grant` is permanent and
+    // trips the reauth circuit breaker, which would short-circuit the second
+    // call and mask what this test is actually about (mutex release).
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async (url) => {
+        const urlStr = typeof url === "string" ? url : (url as URL).toString();
+        if (urlStr.includes("/.well-known/"))
+          return new Response("nope", { status: 404 });
+        return jsonResponse(503, { error: "temporarily_unavailable" });
       });
-    });
 
     const first = await tryRefreshUpstreamTokens(SERVER);
     expect(first.status).toBe("failed");
-    // If the mutex pinned, the second call would also resolve to first's
-    // result. With the finally{} release it re-runs (and would in this
-    // mock again return invalid_grant — what we assert is that the call
-    // *executes* a fresh attempt rather than returning the prior promise).
+    const callsAfterFirst = fetchSpy.mock.calls.length;
+
+    // If the mutex pinned, the second call would resolve to first's result
+    // without touching the network. With the finally{} release it re-runs.
     const second = await tryRefreshUpstreamTokens(SERVER);
     expect(second.status).toBe("failed");
+    expect(fetchSpy.mock.calls.length).toBeGreaterThan(callsAfterFirst);
   });
 
   it("returns failed with upstream details when upstream rejects refresh", async () => {
@@ -264,9 +289,151 @@ describe("tryRefreshUpstreamTokens", () => {
     });
 
     const result = await tryRefreshUpstreamTokens(SERVER);
-    expect(result.status).toBe("failed");
+    // invalid_grant is permanent, so it is reported as needing re-auth rather
+    // than as a generic (retryable) failure.
+    expect(result.status).toBe("reauth_required");
     expect(result.error).toBe("invalid_grant");
     expect(result.upstreamStatus).toBe(400);
     expect(upsert).not.toHaveBeenCalled();
+  });
+
+  it("reports a NON-permanent upstream error as retryable failed", async () => {
+    const { tryRefreshUpstreamTokens, findByMcpServerUuid, isReauthRequired } =
+      await loadModule();
+    findByMcpServerUuid.mockResolvedValue(sessionWithRefreshToken("RT_live"));
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      const urlStr = typeof url === "string" ? url : (url as URL).toString();
+      if (urlStr.includes("/.well-known/"))
+        return new Response("nope", { status: 404 });
+      return jsonResponse(503, { error: "temporarily_unavailable" });
+    });
+
+    const result = await tryRefreshUpstreamTokens(SERVER);
+    expect(result.status).toBe("failed");
+    // A transient error must NOT trip the breaker.
+    expect(isReauthRequired(SERVER.uuid)).toBe(false);
+  });
+});
+
+describe("invalid_grant circuit breaker", () => {
+  const SERVER = {
+    uuid: "00000000-0000-0000-0000-0000000000bb",
+    name: "dead-cred-server",
+    url: "https://api.example.com/mcp",
+  };
+
+  const loadModule = async () => {
+    const repos = await import("../../db/repositories");
+    const mod = await import("./refresh-on-401");
+    return {
+      tryRefreshUpstreamTokens: mod.tryRefreshUpstreamTokens,
+      isReauthRequired: mod.isReauthRequired,
+      resetReauthState: mod._resetReauthState,
+      findByMcpServerUuid: repos.oauthSessionsRepository
+        .findByMcpServerUuid as ReturnType<typeof vi.fn>,
+    };
+  };
+
+  const session = (refreshToken: string) => ({
+    mcp_server_uuid: SERVER.uuid,
+    client_information: {
+      client_id: "c1",
+      token_endpoint: "https://upstream/token",
+    },
+    tokens: {
+      access_token: "OLD",
+      token_type: "Bearer",
+      refresh_token: refreshToken,
+    },
+  });
+
+  const rejectWith = (error: string) =>
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      const urlStr = typeof url === "string" ? url : (url as URL).toString();
+      if (urlStr.includes("/.well-known/"))
+        return new Response("nope", { status: 404 });
+      return jsonResponse(400, { error });
+    });
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    const { resetReauthState } = await loadModule();
+    resetReauthState();
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("stops hitting the network after the first invalid_grant", async () => {
+    const { tryRefreshUpstreamTokens, findByMcpServerUuid, isReauthRequired } =
+      await loadModule();
+    findByMcpServerUuid.mockResolvedValue(session("RT_dead"));
+    const fetchSpy = rejectWith("invalid_grant");
+
+    const first = await tryRefreshUpstreamTokens(SERVER);
+    expect(first.status).toBe("reauth_required");
+    expect(isReauthRequired(SERVER.uuid)).toBe(true);
+    const callsAfterFirst = fetchSpy.mock.calls.length;
+
+    // The storm: many more attempts, none of which should reach the upstream.
+    for (let i = 0; i < 20; i++) {
+      const again = await tryRefreshUpstreamTokens(SERVER);
+      expect(again.status).toBe("reauth_required");
+    }
+    expect(fetchSpy.mock.calls.length).toBe(callsAfterFirst);
+  });
+
+  it("flags the server so it shows red in the UI", async () => {
+    const { tryRefreshUpstreamTokens, findByMcpServerUuid } =
+      await loadModule();
+    const { serverErrorTracker } =
+      await import("../metamcp/server-error-tracker");
+    findByMcpServerUuid.mockResolvedValue(session("RT_dead"));
+    rejectWith("invalid_grant");
+
+    await tryRefreshUpstreamTokens(SERVER);
+    expect(serverErrorTracker.markServerNeedsReauth).toHaveBeenCalledWith(
+      SERVER.uuid,
+    );
+  });
+
+  it("re-opens automatically once the stored refresh token changes (re-auth)", async () => {
+    const { tryRefreshUpstreamTokens, findByMcpServerUuid, isReauthRequired } =
+      await loadModule();
+    findByMcpServerUuid.mockResolvedValue(session("RT_dead"));
+    rejectWith("invalid_grant");
+
+    await tryRefreshUpstreamTokens(SERVER);
+    expect(isReauthRequired(SERVER.uuid)).toBe(true);
+
+    // Ray re-authorizes: a different refresh_token is now stored.
+    findByMcpServerUuid.mockResolvedValue(session("RT_fresh_after_reauth"));
+    vi.restoreAllMocks();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      const urlStr = typeof url === "string" ? url : (url as URL).toString();
+      if (urlStr.includes("/.well-known/"))
+        return new Response("nope", { status: 404 });
+      return jsonResponse(200, {
+        access_token: "NEW",
+        token_type: "Bearer",
+        refresh_token: "RT_rotated",
+      });
+    });
+
+    const after = await tryRefreshUpstreamTokens(SERVER);
+    expect(after.status).toBe("refreshed");
+    expect(isReauthRequired(SERVER.uuid)).toBe(false);
+  });
+
+  it("keeps the breaker per-server — one dead credential does not gag others", async () => {
+    const { tryRefreshUpstreamTokens, findByMcpServerUuid, isReauthRequired } =
+      await loadModule();
+    findByMcpServerUuid.mockResolvedValue(session("RT_dead"));
+    rejectWith("invalid_grant");
+
+    await tryRefreshUpstreamTokens(SERVER);
+    expect(isReauthRequired(SERVER.uuid)).toBe(true);
+    expect(isReauthRequired("00000000-0000-0000-0000-0000000000cc")).toBe(
+      false,
+    );
   });
 });

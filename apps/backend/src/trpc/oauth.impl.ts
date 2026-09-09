@@ -590,6 +590,15 @@ export const oauthImplementations = {
           error_description:
             "OAuth session has no client_id; cannot refresh tokens.",
         };
+      case "reauth_required":
+        return {
+          success: false as const,
+          error: "reauth_required",
+          error_description:
+            result.errorDescription ??
+            "The upstream permanently rejected this server's refresh token. Re-authorize the server to restore it.",
+          upstream_status: result.upstreamStatus,
+        };
       case "failed":
         return {
           success: false as const,

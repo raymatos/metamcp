@@ -19,7 +19,13 @@ BUILD_LOG="${BUILD_LOG:-/tmp/mm-build.log}"
 # Cap the build cache rather than wiping it: keeps same-day rebuilds fast
 # while bounding growth. Unbounded, ~7 rebuilds in a day grew it to 40GB and
 # took the root filesystem to 82% (2026-09-09).
-CACHE_CAP="${CACHE_CAP:-10GB}"
+#
+# Set the cap BELOW the size you actually want to sit at. Measured on docker
+# 29: --max-used-space only evicts *reclaimable* entries and leaves a margin,
+# so a cap at the steady-state size is a no-op — at 10.56GB of cache, a 10GB
+# cap reclaimed 0B while a 5GB cap reclaimed 2.47GB (down to ~8GB). One build
+# adds roughly 5GB.
+CACHE_CAP="${CACHE_CAP:-5GB}"
 
 fail() { echo "DEPLOY_FAIL: $*" >&2; exit 1; }
 

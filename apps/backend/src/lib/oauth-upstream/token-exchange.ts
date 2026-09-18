@@ -39,11 +39,22 @@ export interface UpstreamOAuthError {
 export class UpstreamTokenError extends Error {
   readonly status: number;
   readonly oauthError: UpstreamOAuthError | null;
+  /**
+   * Response diagnostics for the case that motivated them: when the token
+   * endpoint is wrong, the upstream answers with an HTML error page that has
+   * no OAuth error envelope, so `oauthError` is null and the log degrades to
+   * "error=unknown". Carrying the content-type and a body snippet makes a
+   * misrouted request self-evident instead of indistinguishable from the
+   * upstream being broken.
+   */
+  readonly contentType: string | null;
+  readonly bodySnippet: string | null;
 
   constructor(
     status: number,
     oauthError: UpstreamOAuthError | null,
     message?: string,
+    diagnostics?: { contentType?: string | null; bodySnippet?: string | null },
   ) {
     super(
       message ??
@@ -54,7 +65,15 @@ export class UpstreamTokenError extends Error {
     this.name = "UpstreamTokenError";
     this.status = status;
     this.oauthError = oauthError;
+    this.contentType = diagnostics?.contentType ?? null;
+    this.bodySnippet = diagnostics?.bodySnippet ?? null;
   }
+}
+
+/** Collapse a response body to a single short line safe for a log. */
+export function snippetOf(body: string, max = 180): string {
+  const flat = body.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
 }
 
 interface PostFormInput {
@@ -110,9 +129,14 @@ async function postFormToToken({
     body: params,
   });
 
+  // Read as text first: on the failure paths the raw body is the evidence
+  // (an HTML 404 page means the request went somewhere that is not a token
+  // endpoint), and response.json() would discard it.
+  const contentType = response.headers.get("content-type");
+  const rawBody = await response.text();
   let payload: unknown;
   try {
-    payload = await response.json();
+    payload = rawBody ? JSON.parse(rawBody) : null;
   } catch {
     payload = null;
   }
@@ -124,7 +148,10 @@ async function postFormToToken({
       typeof (payload as { error?: unknown }).error === "string"
         ? (payload as UpstreamOAuthError)
         : null;
-    throw new UpstreamTokenError(response.status, oauthError);
+    throw new UpstreamTokenError(response.status, oauthError, undefined, {
+      contentType,
+      bodySnippet: oauthError ? null : snippetOf(rawBody),
+    });
   }
 
   if (!payload || typeof payload !== "object") {
@@ -132,6 +159,7 @@ async function postFormToToken({
       response.status,
       null,
       "Upstream token endpoint returned a non-JSON 2xx response",
+      { contentType, bodySnippet: snippetOf(rawBody) },
     );
   }
   const tokens = payload as OAuthTokens;
@@ -234,10 +262,48 @@ export interface OAuthAuthorizationServerMetadata {
 // URL) so callers can fall back to client_information or the `/token`
 // path. **Throws** on malformed 2xx responses — silently dropping a
 // misconfigured provider's metadata would mask real upstream bugs.
+/**
+ * What a discovery attempt actually did — needed so a caller can say
+ * "discovery at <url> returned <status>" instead of only "it didn't work".
+ */
+export interface DiscoveryAttempt {
+  /** The .well-known URL that was tried, or null if serverUrl was unparseable. */
+  url: string | null;
+  /** HTTP status when a response arrived; null if the request never completed. */
+  status: number | null;
+  /** Network/parse failure detail, when there was one. */
+  error?: string;
+}
+
+export interface DetailedDiscovery {
+  metadata: OAuthAuthorizationServerMetadata | null;
+  attempt: DiscoveryAttempt;
+}
+
+/** Human-readable summary of a discovery attempt, for error messages. */
+export function describeDiscoveryAttempt(attempt: DiscoveryAttempt): string {
+  if (!attempt.url) return "the server URL could not be parsed";
+  if (attempt.error)
+    return `discovery at ${attempt.url} failed (${attempt.error})`;
+  if (attempt.status === null)
+    return `discovery at ${attempt.url} did not complete`;
+  return `discovery at ${attempt.url} returned HTTP ${attempt.status}`;
+}
+
+/** Back-compat wrapper: metadata only. */
 export async function discoverAuthorizationServerMetadata(
   serverUrl: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<OAuthAuthorizationServerMetadata | null> {
+  return (
+    await discoverAuthorizationServerMetadataDetailed(serverUrl, fetchImpl)
+  ).metadata;
+}
+
+export async function discoverAuthorizationServerMetadataDetailed(
+  serverUrl: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<DetailedDiscovery> {
   let wellKnownUrl: URL;
   try {
     wellKnownUrl = new URL(
@@ -245,8 +311,9 @@ export async function discoverAuthorizationServerMetadata(
       serverUrl,
     );
   } catch {
-    return null;
+    return { metadata: null, attempt: { url: null, status: null } };
   }
+  const attempt: DiscoveryAttempt = { url: wellKnownUrl.href, status: null };
 
   let response: Response;
   try {
@@ -254,14 +321,14 @@ export async function discoverAuthorizationServerMetadata(
       headers: { Accept: "application/json" },
     });
   } catch (error) {
+    attempt.error = error instanceof Error ? error.message : String(error);
     logger.warn(
-      `OAuth discovery failed at ${wellKnownUrl.href}: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
+      `OAuth discovery failed at ${wellKnownUrl.href}: ${attempt.error}`,
     );
-    return null;
+    return { metadata: null, attempt };
   }
-  if (!response.ok) return null;
+  attempt.status = response.status;
+  if (!response.ok) return { metadata: null, attempt };
 
   // 2xx but malformed: this is a real upstream bug. Throw so the caller's
   // error path (exchangeToken/refreshToken) surfaces it as
@@ -282,7 +349,7 @@ export async function discoverAuthorizationServerMetadata(
       `OAuth discovery at ${wellKnownUrl.href} returned 2xx but body was not a JSON object`,
     );
   }
-  return data as OAuthAuthorizationServerMetadata;
+  return { metadata: data as OAuthAuthorizationServerMetadata, attempt };
 }
 
 // Determine the token endpoint to POST against. Priority:
@@ -290,25 +357,66 @@ export async function discoverAuthorizationServerMetadata(
 //      UI for providers like Salesforce that publish the endpoint OOB)
 //   2. The `token_endpoint` returned by `.well-known` discovery
 //   3. Fallback to `<server_url>/token` (matches the MCP SDK's behavior)
+export type TokenEndpointResolution =
+  | {
+      ok: true;
+      tokenEndpoint: string;
+      source: "client_information" | "discovery";
+    }
+  | { ok: false; message: string };
+
+/**
+ * Resolve the upstream token endpoint from the stored client registration or
+ * from discovery. There is deliberately NO third "guess" tier.
+ *
+ * This used to fall back to `new URL("/token", serverUrl)`, which is wrong for
+ * any server whose OAuth endpoints are not at the origin root — and it fails
+ * invisibly, because the fabricated URL lands on the upstream's web app and
+ * returns an HTML 404 with no OAuth error envelope, so the caller logs
+ * `status=404 error=unknown`. Measured across this deployment, the guess was
+ * wrong for EVERY server: the one server not on tier 1 discovers
+ * `/mcp/oauth/token`, while the guess would POST to `/token` (404). A loud,
+ * actionable failure is strictly better than a silent wrong request.
+ */
 export function resolveTokenEndpoint(args: {
   clientInformation: Record<string, unknown> | null | undefined;
   discovered: OAuthAuthorizationServerMetadata | null;
-  serverUrl: string;
-}): string {
+  serverName?: string;
+  /** Discovery attempt detail, so the failure can say what was tried. */
+  discoveryAttempt?: DiscoveryAttempt;
+}): TokenEndpointResolution {
   const ci = args.clientInformation as
     | { token_endpoint?: unknown }
     | null
     | undefined;
   if (typeof ci?.token_endpoint === "string" && ci.token_endpoint.length > 0) {
-    return ci.token_endpoint;
+    return {
+      ok: true,
+      tokenEndpoint: ci.token_endpoint,
+      source: "client_information",
+    };
   }
   if (
     args.discovered?.token_endpoint &&
     typeof args.discovered.token_endpoint === "string"
   ) {
-    return args.discovered.token_endpoint;
+    return {
+      ok: true,
+      tokenEndpoint: args.discovered.token_endpoint,
+      source: "discovery",
+    };
   }
-  return new URL("/token", args.serverUrl).toString();
+  const who = args.serverName ? `"${args.serverName}"` : "this server";
+  const tried = args.discoveryAttempt
+    ? describeDiscoveryAttempt(args.discoveryAttempt)
+    : "discovery was not attempted";
+  return {
+    ok: false,
+    message:
+      `No OAuth token endpoint for ${who}: it is absent from the stored client ` +
+      `registration, and ${tried}. Re-authorize the server, or set ` +
+      `token_endpoint on the pre-registered OAuth client form.`,
+  };
 }
 
 // Pick the token endpoint auth method, honoring (in order):

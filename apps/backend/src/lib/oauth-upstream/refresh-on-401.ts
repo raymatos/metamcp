@@ -25,7 +25,7 @@ import { ServerParameters } from "@repo/zod-types";
 import { oauthSessionsRepository } from "../../db/repositories";
 import logger from "../../utils/logger";
 import {
-  discoverAuthorizationServerMetadata,
+  discoverAuthorizationServerMetadataDetailed,
   OAuthTokens,
   redactToken,
   refreshAccessToken,
@@ -179,14 +179,25 @@ async function doRefresh(
       ? (clientInformation.client_secret as string)
       : undefined;
 
-  const discovered = await discoverAuthorizationServerMetadata(
-    serverParams.url,
-  );
-  const tokenEndpoint = resolveTokenEndpoint({
+  const { metadata: discovered, attempt: discoveryAttempt } =
+    await discoverAuthorizationServerMetadataDetailed(serverParams.url);
+  const resolution = resolveTokenEndpoint({
     clientInformation,
     discovered,
-    serverUrl: serverParams.url,
+    serverName: serverParams.name,
+    discoveryAttempt,
   });
+  if (!resolution.ok) {
+    // No endpoint could be resolved. Previously this fabricated
+    // <origin>/token and POSTed into the dark; now it fails with the reason.
+    logger.error(`[oauth] ${resolution.message} (server=${serverParams.uuid})`);
+    return {
+      status: "failed",
+      error: "no_token_endpoint",
+      errorDescription: resolution.message,
+    };
+  }
+  const tokenEndpoint = resolution.tokenEndpoint;
   const authMethod = resolveTokenEndpointAuthMethod({
     clientInformation,
     discovered,
@@ -241,9 +252,34 @@ async function doRefresh(
         };
       }
 
+      // Include WHERE the request went and WHAT came back. Without the URL,
+      // a misrouted token request (HTML 404 from the upstream's web app, no
+      // OAuth envelope, so error=unknown) is indistinguishable from the
+      // upstream being down — the log has to carry it, because the line that
+      // did name the endpoint is an INFO and production runs above INFO.
+      // A body with no OAuth envelope means this response did not come from
+      // an OAuth token endpoint at all. Name both plausible causes rather
+      // than suppressing retries: it is either the wrong URL (permanent) or
+      // the upstream mid-deploy with its edge serving an error page
+      // (transient, and observed — STAGEAPH's 404s all landed within seconds
+      // of a stage deploy finishing). Because the transient case is real,
+      // this deliberately does NOT trip the reauth breaker; doing so would
+      // lock out a healthy server on every deploy.
+      const looksNonOAuth = Boolean(error.bodySnippet);
+      const detail = [
+        `token_endpoint=${tokenEndpoint}`,
+        `source=${resolution.source}`,
+        error.contentType ? `content_type=${error.contentType}` : null,
+        error.bodySnippet ? `body="${error.bodySnippet}"` : null,
+        looksNonOAuth
+          ? "hint=non-OAuth response body; check the token endpoint is correct, or whether the upstream was mid-deploy"
+          : null,
+      ]
+        .filter(Boolean)
+        .join(" ");
       logger.warn(
         `[oauth] proxy refresh failed — server=${serverParams.uuid} ` +
-          `status=${error.status} error=${oauthError}`,
+          `status=${error.status} error=${oauthError} ${detail}`,
       );
       return {
         status: "failed",

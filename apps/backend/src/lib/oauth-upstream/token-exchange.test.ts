@@ -319,35 +319,184 @@ describe("discoverAuthorizationServerMetadata", () => {
   });
 });
 
+describe("UpstreamTokenError response diagnostics", () => {
+  // The failure that motivated these: a token request sent to the wrong URL
+  // lands on the upstream's web app, which answers with an HTML 404 carrying
+  // no OAuth error envelope. The log then degraded to "status=404
+  // error=unknown" with no indication of WHERE the request went, making a
+  // MetaMCP misconfiguration indistinguishable from a broken upstream.
+  const HTML_404 =
+    "<!DOCTYPE html><html><head><title>404: This page could not be found.</title>" +
+    "</head><body><h1>404</h1></body></html>";
+
+  it("captures content-type and a body snippet for a non-OAuth error body", async () => {
+    const fetchImpl = vi.fn<FetchImpl>(
+      async () =>
+        new Response(HTML_404, {
+          status: 404,
+          headers: { "Content-Type": "text/html; charset=utf-8" },
+        }),
+    );
+
+    const err = await refreshAccessToken({
+      tokenEndpoint: "https://example.com/token",
+      refreshToken: "RT",
+      clientId: "client-1",
+      authMethod: "none",
+      fetchImpl,
+    }).catch((e) => e);
+
+    expect(err).toBeInstanceOf(UpstreamTokenError);
+    expect(err.status).toBe(404);
+    expect(err.oauthError).toBeNull();
+    expect(err.contentType).toContain("text/html");
+    expect(err.bodySnippet).toContain("404");
+    // Flattened to one line so an HTML page cannot spam the log.
+    expect(err.bodySnippet).not.toContain("\n");
+  });
+
+  it("does not attach a body snippet when a proper OAuth envelope is present", async () => {
+    const fetchImpl = vi.fn<FetchImpl>(async () =>
+      jsonResponse(400, {
+        error: "invalid_grant",
+        error_description: "Refresh token revoked",
+      }),
+    );
+
+    const err = await refreshAccessToken({
+      tokenEndpoint: "https://example.com/token",
+      refreshToken: "RT",
+      clientId: "client-1",
+      authMethod: "none",
+      fetchImpl,
+    }).catch((e) => e);
+
+    expect(err.oauthError?.error).toBe("invalid_grant");
+    expect(err.bodySnippet).toBeNull();
+  });
+
+  it("truncates a long body", async () => {
+    const fetchImpl = vi.fn<FetchImpl>(
+      async () =>
+        new Response("x".repeat(5000), {
+          status: 500,
+          headers: { "Content-Type": "text/html" },
+        }),
+    );
+    const err = await refreshAccessToken({
+      tokenEndpoint: "https://example.com/token",
+      refreshToken: "RT",
+      clientId: "client-1",
+      authMethod: "none",
+      fetchImpl,
+    }).catch((e) => e);
+    expect(err.bodySnippet.length).toBeLessThan(250);
+    expect(err.bodySnippet.endsWith("…")).toBe(true);
+  });
+});
+
 describe("resolveTokenEndpoint", () => {
-  it("prefers client_information.token_endpoint when set", () => {
-    expect(
-      resolveTokenEndpoint({
-        clientInformation: { token_endpoint: "https://upstream/oauth/token" },
-        discovered: { token_endpoint: "https://discovered/token" },
-        serverUrl: "https://server/mcp",
-      }),
-    ).toBe("https://upstream/oauth/token");
+  it("tier 1 wins: client_information.token_endpoint beats discovery", () => {
+    const r = resolveTokenEndpoint({
+      clientInformation: { token_endpoint: "https://upstream/oauth/token" },
+      discovered: { token_endpoint: "https://discovered/token" },
+    });
+    expect(r).toEqual({
+      ok: true,
+      tokenEndpoint: "https://upstream/oauth/token",
+      source: "client_information",
+    });
   });
 
-  it("falls back to discovered token_endpoint when client_information lacks it", () => {
-    expect(
-      resolveTokenEndpoint({
-        clientInformation: { client_id: "x" },
-        discovered: { token_endpoint: "https://discovered/token" },
-        serverUrl: "https://server/mcp",
-      }),
-    ).toBe("https://discovered/token");
+  it("tier 2 is used when client_information lacks an endpoint", () => {
+    const r = resolveTokenEndpoint({
+      clientInformation: { client_id: "x" },
+      discovered: { token_endpoint: "https://discovered/token" },
+    });
+    expect(r).toEqual({
+      ok: true,
+      tokenEndpoint: "https://discovered/token",
+      source: "discovery",
+    });
   });
 
-  it("falls back to <serverUrl>/token when neither source has an endpoint", () => {
+  it("ignores a non-string or empty client_information.token_endpoint", () => {
     expect(
       resolveTokenEndpoint({
-        clientInformation: null,
-        discovered: null,
-        serverUrl: "https://server.example.com/mcp",
+        clientInformation: { token_endpoint: "" },
+        discovered: { token_endpoint: "https://discovered/token" },
       }),
-    ).toBe("https://server.example.com/token");
+    ).toMatchObject({ ok: true, source: "discovery" });
+    expect(
+      resolveTokenEndpoint({
+        clientInformation: { token_endpoint: 42 as unknown as string },
+        discovered: { token_endpoint: "https://discovered/token" },
+      }),
+    ).toMatchObject({ ok: true, source: "discovery" });
+  });
+
+  it("FAILS LOUDLY instead of fabricating <origin>/token", () => {
+    // The removed tier 3 guessed <origin>/token, which is wrong for any
+    // server whose OAuth endpoints are not at the origin root; the guess then
+    // hit the upstream's web app and returned an HTML 404 with no OAuth error
+    // envelope, logging only "status=404 error=unknown".
+    const r = resolveTokenEndpoint({
+      clientInformation: null,
+      discovered: null,
+      serverName: "STAGEAPH",
+      discoveryAttempt: {
+        url: "https://stage.example.com/.well-known/oauth-authorization-server",
+        status: 404,
+      },
+    });
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error("expected failure");
+    expect(r.message).not.toContain('/token"');
+    expect(JSON.stringify(r)).not.toContain("https://stage.example.com/token");
+  });
+
+  it("names the server, the URL tried, and what it returned", () => {
+    const r = resolveTokenEndpoint({
+      clientInformation: { client_id: "x" },
+      discovered: null,
+      serverName: "STAGEAPH",
+      discoveryAttempt: {
+        url: "https://stage.example.com/.well-known/oauth-authorization-server",
+        status: 404,
+      },
+    });
+    if (r.ok) throw new Error("expected failure");
+    expect(r.message).toContain("STAGEAPH");
+    expect(r.message).toContain(
+      "https://stage.example.com/.well-known/oauth-authorization-server",
+    );
+    expect(r.message).toContain("404");
+    expect(r.message).toContain("Re-authorize");
+  });
+
+  it("describes a discovery attempt that never completed", () => {
+    const r = resolveTokenEndpoint({
+      clientInformation: null,
+      discovered: null,
+      serverName: "flaky",
+      discoveryAttempt: {
+        url: "https://flaky.example.com/.well-known/oauth-authorization-server",
+        status: null,
+        error: "ECONNREFUSED",
+      },
+    });
+    if (r.ok) throw new Error("expected failure");
+    expect(r.message).toContain("ECONNREFUSED");
+  });
+
+  it("still fails cleanly when no discovery attempt is supplied", () => {
+    const r = resolveTokenEndpoint({
+      clientInformation: null,
+      discovered: null,
+    });
+    if (r.ok) throw new Error("expected failure");
+    expect(r.message).toContain("this server");
+    expect(r.message).toContain("discovery was not attempted");
   });
 });
 

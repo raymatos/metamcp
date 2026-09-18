@@ -29,7 +29,7 @@ import {
 } from "../lib/oauth-upstream/authorize-flow";
 import { tryRefreshUpstreamTokens } from "../lib/oauth-upstream/refresh-on-401";
 import {
-  discoverAuthorizationServerMetadata,
+  discoverAuthorizationServerMetadataDetailed,
   exchangeAuthorizationCode,
   OAuthTokens,
   redactToken,
@@ -451,12 +451,22 @@ export const oauthImplementations = {
         ? (clientInformation.client_secret as string)
         : undefined;
 
-    const discovered = await discoverAuthorizationServerMetadata(serverUrl);
-    const tokenEndpoint = resolveTokenEndpoint({
+    const { metadata: discovered, attempt: discoveryAttempt } =
+      await discoverAuthorizationServerMetadataDetailed(serverUrl);
+    const resolution = resolveTokenEndpoint({
       clientInformation,
       discovered,
-      serverUrl,
+      discoveryAttempt,
     });
+    if (!resolution.ok) {
+      logger.error(`[oauth] ${resolution.message}`);
+      return {
+        success: false as const,
+        error: "no_token_endpoint",
+        error_description: resolution.message,
+      };
+    }
+    const tokenEndpoint = resolution.tokenEndpoint;
     const authMethod = resolveTokenEndpointAuthMethod({
       clientInformation,
       discovered,

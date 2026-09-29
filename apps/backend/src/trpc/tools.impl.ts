@@ -95,9 +95,6 @@ export const toolsImplementations = {
       );
 
       if (hasChanged) {
-        // Update cache
-        toolsSyncCache.update(input.mcpServerUuid, toolNames);
-
         // Perform sync with cleanup
         const { upserted, deleted } = await toolsRepository.syncTools({
           tools: input.tools,
@@ -119,6 +116,10 @@ export const toolsImplementations = {
             }),
           ),
         );
+
+        // Record the list as seen only once the write has succeeded, so a
+        // failed write is retried on the next refresh instead of skipped.
+        toolsSyncCache.update(input.mcpServerUuid, toolNames);
 
         const message =
           deleted.length > 0

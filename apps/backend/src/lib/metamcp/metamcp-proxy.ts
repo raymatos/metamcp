@@ -384,10 +384,9 @@ export const createServer = async (
               );
 
               if (toolsToSave.length > 0) {
-                // Update cache
-                toolsSyncCache.update(mcpServerUuid, toolNames);
-
-                // Sync with cleanup
+                // sync() owns the hash cache: it records the new list only
+                // after the DB write succeeds. Updating it here made sync()
+                // see "unchanged" and skip the write every time.
                 await toolsImplementations.sync({
                   tools: toolsToSave,
                   mcpServerUuid: mcpServerUuid,

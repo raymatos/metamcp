@@ -69,8 +69,10 @@ LABEL org.opencontainers.image.licenses="MIT"
 LABEL org.opencontainers.image.title="MetaMCP"
 LABEL org.opencontainers.image.vendor="metatool-ai"
 
-# Install curl for health checks
-RUN apt-get update && apt-get install -y curl postgresql-client && apt-get clean && rm -rf /var/lib/apt/lists/*
+# Install curl for health checks. Also upgrade libbrotli1: the uv:debian base ships 1.1.0-2+b7,
+# vulnerable to CVE-2026-111497 (HTTP2Shell); the Debian fix is 1.1.0-2+deb13u1.
+RUN apt-get update && apt-get install -y curl postgresql-client && apt-get install -y --only-upgrade libbrotli1 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # STDIO MCP server binaries that hosted server definitions invoke by name.
 # mcp-grafana (Go, no npm/PyPI distribution) — pinned for reproducible builds.

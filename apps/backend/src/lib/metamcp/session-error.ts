@@ -24,7 +24,8 @@
  *   2. Falls back to `String(error)` for non-Error throwables (some SDK
  *      paths reject with plain objects, McpError wrappers, or strings).
  *   3. Inspects a numeric/string `.code` field on object inputs (some
- *      RPC layers strip the message but preserve the code).
+ *      RPC layers strip the message but preserve the code). The SDK's own
+ *      request timeouts share -32001 and are excluded.
  *
  * When this fires, the cached backend connection is dead: MetaMCP must drop
  * it, send a new `initialize`, and replay the failed request. The MCP spec
@@ -75,8 +76,36 @@ function stringMatchesSessionLost(value: string): boolean {
   );
 }
 
+// The MCP SDK raises both of its local timeouts ("Request timed out" and
+// "Maximum total timeout exceeded") with ErrorCode.RequestTimeout, which is
+// also -32001. They say nothing about the session: the backend may still be
+// running the call. Treating one as session loss kills the backend's processes
+// through the pool and replays the call, which for a tool that sends mail or
+// writes data can interrupt or repeat the side effect (INFRA-36).
+function isSdkRequestTimeout(candidate: object): boolean {
+  const { code, message, data } = candidate as {
+    code?: unknown;
+    message?: unknown;
+    data?: unknown;
+  };
+  if (code !== -32001 && code !== "-32001") {
+    return false;
+  }
+  if (typeof message === "string" && /timed out|timeout/i.test(message)) {
+    return true;
+  }
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    ("timeout" in data || "maxTotalTimeout" in data)
+  );
+}
+
 function objectHasSessionLostCode(candidate: unknown): boolean {
   if (typeof candidate !== "object" || candidate === null) {
+    return false;
+  }
+  if (isSdkRequestTimeout(candidate)) {
     return false;
   }
   const code = (candidate as { code?: unknown }).code;

@@ -1,3 +1,11 @@
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import {
+  CallToolRequestSchema,
+  ErrorCode,
+  McpError,
+} from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -223,5 +231,77 @@ describe("isRecoverableBackendError", () => {
         error: { code: -32603, message: "Internal error" },
       }),
     ).toBe(false);
+  });
+});
+
+// INFRA-36: a timed-out call may still be running on the backend, so it must
+// not invalidate the pool or get replayed.
+describe("SDK request timeouts", () => {
+  async function realTimeoutError(): Promise<unknown> {
+    const server = new Server(
+      { name: "hanging", version: "1.0.0" },
+      { capabilities: { tools: {} } },
+    );
+    server.setRequestHandler(
+      CallToolRequestSchema,
+      () => new Promise(() => {}),
+    );
+    const client = new Client({ name: "test", version: "1.0.0" });
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
+    try {
+      return await client
+        .callTool({ name: "send", arguments: {} }, undefined, { timeout: 5 })
+        .then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+    } finally {
+      await client.close();
+    }
+  }
+
+  it("does not treat a timeout raised by a real SDK client as recoverable", async () => {
+    const error = await realTimeoutError();
+    expect((error as McpError).code).toBe(ErrorCode.RequestTimeout);
+    expect(isBackendSessionLostError(error)).toBe(false);
+    expect(isRecoverableBackendError(error)).toBe(false);
+  });
+
+  it("does not treat the maximum total timeout as recoverable", () => {
+    const error = new McpError(
+      ErrorCode.RequestTimeout,
+      "Maximum total timeout exceeded",
+      { maxTotalTimeout: 60000, totalElapsed: 60001 },
+    );
+    expect(isRecoverableBackendError(error)).toBe(false);
+  });
+
+  it("does not match a timeout wrapped via .cause", () => {
+    const inner = new McpError(ErrorCode.RequestTimeout, "Request timed out", {
+      timeout: 60000,
+    });
+    const outer = new Error("Tool call failed", { cause: inner });
+    expect(isRecoverableBackendError(outer)).toBe(false);
+  });
+
+  it("does not match a timeout passed as a plain object", () => {
+    expect(
+      isRecoverableBackendError({ code: -32001, message: "Request timed out" }),
+    ).toBe(false);
+    expect(
+      isRecoverableBackendError({ code: "-32001", data: { timeout: 60000 } }),
+    ).toBe(false);
+  });
+
+  it("still treats a session-not-found -32001 as session loss", () => {
+    const error = new McpError(-32001, "Session not found");
+    expect(isRecoverableBackendError(error)).toBe(true);
+    expect(isRecoverableBackendError({ code: -32001 })).toBe(true);
+  });
+
+  it("does not replay a call whose connection closed mid-flight", () => {
+    const error = new McpError(ErrorCode.ConnectionClosed, "Connection closed");
+    expect(isRecoverableBackendError(error)).toBe(false);
   });
 });
